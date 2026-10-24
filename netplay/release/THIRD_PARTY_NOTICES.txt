@@ -46,7 +46,7 @@ Source code and relinking (LGPL 2.1, section 6):
   https://github.com/sal063/AC6_recomp at commit 5d350c293a984b6a4e11c2759f1d09472c50a87e.
 - The complete source of this program (AC6 Recomp + ReXGlue SDK + netplay changes) is
   available at:
-  Source for this build: <URL to be filled in before publishing>
+  Source for this build: https://github.com/DogeXH/AC6_recomp/tree/netplay-online (commit 7d841e65)
 - To relink with a modified FFmpeg or libmspack: get that source, replace the library's
   directory with your modified version, generate the recompiled game code from your own copy
   of the game (it is produced from the game executable and cannot be distributed), and build
