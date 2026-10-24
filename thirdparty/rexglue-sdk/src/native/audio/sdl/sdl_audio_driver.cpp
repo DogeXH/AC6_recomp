@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include <SDL3/SDL_init.h>
+#include <SDL3/SDL_timer.h>
 
 #include <native/audio/audio_runtime.h>
 #include <native/audio/conversion.h>
@@ -18,6 +19,7 @@
 
 REXCVAR_DECLARE(bool, audio_mute);
 REXCVAR_DECLARE(bool, audio_trace_render_driver_verbose);
+REXCVAR_DECLARE(bool, audio_trace_telemetry);
 
 namespace rex::audio::sdl {
 
@@ -170,6 +172,7 @@ void SdlAudioDriver::SubmitSilenceFrame() {
   const uint32_t submitted = submitted_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
   const uint32_t queued_depth = queued_depth_.fetch_add(1, std::memory_order_relaxed) + 1;
   silence_injections_.fetch_add(1, std::memory_order_relaxed);
+  explicit_silence_submissions_.fetch_add(1, std::memory_order_relaxed);
   uint32_t previous_peak = peak_queued_depth_.load(std::memory_order_relaxed);
   while (queued_depth > previous_peak &&
          !peak_queued_depth_.compare_exchange_weak(previous_peak, queued_depth,
@@ -188,7 +191,7 @@ void SdlAudioDriver::SubmitSilenceFrame() {
 }
 
 AudioDriverTelemetry SdlAudioDriver::GetTelemetry() const {
-  return AudioDriverTelemetry{
+  AudioDriverTelemetry telemetry{
       submitted_frames_.load(std::memory_order_relaxed),
       consumed_frames_.load(std::memory_order_relaxed),
       underrun_count_.load(std::memory_order_relaxed),
@@ -196,6 +199,13 @@ AudioDriverTelemetry SdlAudioDriver::GetTelemetry() const {
       queued_depth_.load(std::memory_order_relaxed),
       peak_queued_depth_.load(std::memory_order_relaxed),
   };
+  telemetry.explicit_silence_submissions =
+      explicit_silence_submissions_.load(std::memory_order_relaxed);
+  telemetry.zero_output_frames =
+      zero_output_frames_.load(std::memory_order_relaxed);
+  telemetry.nonzero_output_frames =
+      nonzero_output_frames_.load(std::memory_order_relaxed);
+  return telemetry;
 }
 
 void SDLCALL SdlAudioDriver::StreamCallback(void* userdata, SDL_AudioStream* stream,
@@ -231,6 +241,14 @@ void SdlAudioDriver::FillStream(SDL_AudioStream* stream, int bytes_needed) {
         } else {
           std::memset(pending_output_frame_.data(), 0, sizeof(float) * pending_output_frame_.size());
         }
+        if (REXCVAR_GET(audio_trace_telemetry)) {
+          const bool output_is_zero =
+              std::all_of(pending_output_frame_.begin(),
+                          pending_output_frame_.end(),
+                          [](float sample) { return sample == 0.0f; });
+          (output_is_zero ? zero_output_frames_ : nonzero_output_frames_)
+              .fetch_add(1, std::memory_order_relaxed);
+        }
         pending_output_float_count_ = pending_output_frame_.size();
         {
           std::lock_guard<std::mutex> guard(frames_mutex_);
@@ -246,6 +264,16 @@ void SdlAudioDriver::FillStream(SDL_AudioStream* stream, int bytes_needed) {
       }
       ++underrun_count_;
       ++silence_injections_;
+      // Field telemetry: audible tearing must never be invisible in logs.
+      // Rate-limited to one line per 5s; runs only on the SDL audio thread.
+      const uint64_t now_ms = SDL_GetTicks();
+      if (now_ms - last_underrun_log_ms_ >= 5000) {
+        last_underrun_log_ms_ = now_ms;
+        REXAPU_WARN("Audio underrun: silence injected (total {}), submitted={} consumed={}",
+                    underrun_count_.load(std::memory_order_relaxed),
+                    submitted_frames_.load(std::memory_order_relaxed),
+                    consumed_frames_.load(std::memory_order_relaxed));
+      }
       bytes_needed -= std::min(bytes_needed, kOutputFrameBytes);
       
       consumed_frames_.fetch_add(1, std::memory_order_relaxed);

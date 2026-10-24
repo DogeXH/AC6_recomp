@@ -109,22 +109,29 @@ class GraphicsSystem : public system::IGraphicsSystem {
   static void SetGuestVblankHzOverride(double hz);
   static double GetGuestVblankHzOverride();
 
-  // Modern present pacing: while target_hz > 0, PaceGuestPresent (called by
-  // VdSwap on the guest thread that submits swaps) blocks that thread until
-  // every previously issued swap has been delivered to the presenter (GPU
-  // backpressure, frame latency 1), then rate-limits it to target_hz with an
-  // absolute-deadline limiter. The game then runs at min(target, real GPU
-  // throughput) with uniform frame times - the modern game loop - instead of
-  // quantizing to vblank-grid sub-harmonics (60/30/20) when the GPU cannot
-  // hold the target. Combine with a free-running guest vblank so the vblank
-  // wait never gates. target_hz 0 = off. Process-wide, not per-instance.
+  // Modern present pacing pairs committed VdSwap PM4 packets reserved by
+  // PaceGuestPresent with exactly-once terminal IssueSwap retirements. While
+  // target_hz > 0, reservation waits for room in the configured retirement
+  // window and applies an absolute-deadline ceiling. target_hz 0 disables the
+  // waits, but committed swaps are still accounted. Process-wide.
   static void SetGuestPresentPacing(double target_hz);
-  // Called by VdSwap on the swapping guest thread before it submits the next
-  // swap; blocks per SetGuestPresentPacing. No-op while pacing is off.
-  static void PaceGuestPresent();
-  // Called by the command processor whenever a guest frame is actually
-  // delivered to the presenter (guest output refreshed for a swap).
-  static void NotifyGuestPresent();
+  // Sets the retirement window, clamped to [1, 2]. One is the default; two is
+  // the opt-in guest / command-processor overlap experiment.
+  static void SetGuestPresentMaxInFlight(uint32_t max_in_flight);
+  // Enables aggregate overlap telemetry. Off by default. Reports are emitted
+  // at most every 300 active reservations, plus arm transitions/end.
+  static void SetGuestPresentTelemetryEnabled(bool enabled);
+  // Called by VdSwap only after validation and after HandleVideoSwap declines
+  // ownership, immediately before constructing the committed PM4 swap packet.
+  // Returns true only when a matching retirement reservation was created; a
+  // false result must leave the already-reserved ring range filled with NOPs.
+  static bool PaceGuestPresent();
+  // Exactly-once terminal retirement for a committed IssueSwap. delivered is
+  // true only when the presenter accepted a refreshed guest output; false for
+  // every early, skipped, failed, or otherwise dropped terminal path. A paired
+  // drop is counted but keeps backpressure active; only a missing or unpaired
+  // retirement may force pacing to fail open.
+  static void RetireGuestPresent(bool delivered);
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);

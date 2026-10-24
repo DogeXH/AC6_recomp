@@ -98,6 +98,7 @@ class XmaDecoder {
 
  private:
   void WorkerThreadMain();
+  std::unique_lock<std::mutex> LockContextForGuestWrite(uint32_t guest_ptr);
   XMA_CONTEXT_DATA* TranslateManagedContext(uint32_t guest_ptr, const char* caller) const;
   uint32_t ResolvePhysicalAddress(uint32_t guest_ptr, const char* caller) const;
   void StoreContextIndexedRegister(uint32_t base_reg, uint32_t context_ptr);

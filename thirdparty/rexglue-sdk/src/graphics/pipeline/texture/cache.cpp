@@ -10,7 +10,10 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 #include <rex/assert.h>
@@ -47,6 +50,12 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
 
 REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    texture_cache_selective_binding_invalidation, false, "GPU",
+    "When watched texture data changes, rebuild only bindings that reference an "
+    "outdated texture instead of invalidating every active texture binding")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
@@ -121,6 +130,30 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 //     "textures - so with 2x2 resolution scaling, the soft limit will be 360 + "
 //     "96 MB, and with 3x3, it will be 360 + 216 MB.",
 //     "GPU");
+
+namespace {
+
+uint64_t TextureRequestProfileNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+uint32_t TextureRequestProfileCountBits(uint32_t value) {
+  uint32_t count = 0;
+  while (value) {
+    value &= value - 1;
+    ++count;
+  }
+  return count;
+}
+
+bool TextureRequestProfileEnabledFromEnvironment() {
+  const char* value = std::getenv("AC6_TEXTURE_REQUEST_PROFILE");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+}  // namespace
 
 namespace rex::graphics {
 
@@ -203,6 +236,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
       shared_memory_(shared_memory),
       draw_resolution_scale_x_(draw_resolution_scale_x),
       draw_resolution_scale_y_(draw_resolution_scale_y) {
+  texture_request_profile_enabled_ = TextureRequestProfileEnabledFromEnvironment();
+
   assert_true(draw_resolution_scale_x >= 1);
   assert_true(draw_resolution_scale_x <= kMaxDrawResolutionScaleAlongAxis);
   assert_true(draw_resolution_scale_y >= 1);
@@ -444,42 +479,117 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+  const bool profile_enabled = texture_request_profile_enabled_;
+  uint64_t total_start_ns = 0;
+  if (profile_enabled) {
+    total_start_ns = TextureRequestProfileNowNs();
+    ++texture_request_profile_.base_calls;
+  }
+
   const auto& regs = register_file();
 
+  uint64_t invalidation_start_ns = 0;
+  if (profile_enabled) {
+    invalidation_start_ns = TextureRequestProfileNowNs();
+  }
   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+    uint32_t bindings_in_sync_before = texture_bindings_in_sync_;
+    if (profile_enabled) {
+      ++texture_request_profile_.outdated_signals;
+    }
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
-    ResetTextureBindings();
+    if (REXCVAR_GET(texture_cache_selective_binding_invalidation)) {
+      ResetOutdatedTextureBindings();
+    } else {
+      ResetTextureBindings();
+    }
+    if (profile_enabled) {
+      texture_request_profile_.invalidated_bindings += TextureRequestProfileCountBits(
+          bindings_in_sync_before & ~texture_bindings_in_sync_);
+    }
+  }
+  if (profile_enabled) {
+    texture_request_profile_.base_invalidation_ns +=
+        TextureRequestProfileNowNs() - invalidation_start_ns;
   }
 
   // Update the texture keys and the textures.
+  uint64_t binding_start_ns = 0;
+  uint64_t lookup_ns = 0;
+  uint64_t prepare_ns = 0;
+  if (profile_enabled) {
+    binding_start_ns = TextureRequestProfileNowNs();
+  }
   uint32_t bindings_changed = 0;
   std::vector<PendingTextureLoad> pending_texture_loads;
   std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
+  auto find_or_create_texture = [&](TextureKey key) -> Texture* {
+    uint64_t lookup_start_ns = 0;
+    size_t texture_count_before = 0;
+    if (profile_enabled) {
+      lookup_start_ns = TextureRequestProfileNowNs();
+      texture_count_before = textures_.size();
+      ++texture_request_profile_.texture_lookups;
+    }
+    Texture* texture = FindOrCreateTexture(key);
+    if (profile_enabled) {
+      lookup_ns += TextureRequestProfileNowNs() - lookup_start_ns;
+      texture_request_profile_.textures_created += textures_.size() > texture_count_before ? 1 : 0;
+      texture_request_profile_.texture_lookup_nulls += texture == nullptr ? 1 : 0;
+    }
+    return texture;
+  };
   auto queue_pending_texture_load = [&](Texture* texture) {
+    uint64_t prepare_start_ns = 0;
+    if (profile_enabled) {
+      prepare_start_ns = TextureRequestProfileNowNs();
+    }
+    auto finish_profile = [&]() {
+      if (profile_enabled) {
+        prepare_ns += TextureRequestProfileNowNs() - prepare_start_ns;
+      }
+    };
     if (texture == nullptr) {
+      finish_profile();
       return;
     }
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
       if (pending_load.texture == texture) {
+        if (profile_enabled) {
+          ++texture_request_profile_.prepare_dedup_hits;
+        }
+        finish_profile();
         return;
       }
+    }
+    if (profile_enabled) {
+      ++texture_request_profile_.prepare_calls;
     }
     PendingTextureLoad pending_load;
     PendingSharedMemoryRange pending_ranges[2];
     size_t pending_range_count = 0;
     if (!PrepareTextureLoad(*texture, pending_load, pending_ranges, pending_range_count)) {
+      finish_profile();
       return;
     }
     pending_texture_loads.push_back(pending_load);
     for (size_t i = 0; i < pending_range_count; ++i) {
       pending_shared_memory_ranges.push_back(pending_ranges[i]);
     }
+    finish_profile();
   };
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
+  if (profile_enabled) {
+    texture_request_profile_.out_of_sync_bindings +=
+        TextureRequestProfileCountBits(textures_remaining);
+  }
   uint32_t index = 0;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
+    if (profile_enabled) {
+      ++texture_request_profile_.parsed_bindings;
+    }
     uint32_t index_bit = UINT32_C(1) << index;
     textures_remaining &= ~index_bit;
     TextureBinding& binding = texture_bindings_[index];
@@ -492,6 +602,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
+      if (profile_enabled) {
+        ++texture_request_profile_.invalid_fetches;
+      }
       if (old_key.is_valid) {
         bindings_changed |= index_bit;
       }
@@ -524,7 +637,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // load).
       if (any_sign_is_not_signed) {
         if (key_changed || !any_sign_was_not_signed) {
-          binding.texture = FindOrCreateTexture(binding.key);
+          binding.texture = find_or_create_texture(binding.key);
           load_unsigned_data = true;
         }
       } else {
@@ -534,7 +647,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         if (key_changed || !any_sign_was_signed) {
           TextureKey signed_key = binding.key;
           signed_key.signed_separate = 1;
-          binding.texture_signed = FindOrCreateTexture(signed_key);
+          binding.texture_signed = find_or_create_texture(signed_key);
           load_signed_data = true;
         }
       } else {
@@ -544,7 +657,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // Same resource for both unsigned and signed, but descriptor formats may
       // be different.
       if (key_changed) {
-        binding.texture = FindOrCreateTexture(binding.key);
+        binding.texture = find_or_create_texture(binding.key);
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
@@ -556,6 +669,17 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       queue_pending_texture_load(binding.texture_signed);
     }
   }
+  if (profile_enabled) {
+    uint64_t binding_inclusive_ns = TextureRequestProfileNowNs() - binding_start_ns;
+    texture_request_profile_.base_lookup_ns += lookup_ns;
+    texture_request_profile_.base_prepare_ns += prepare_ns;
+    texture_request_profile_.base_binding_ns += binding_inclusive_ns - lookup_ns - prepare_ns;
+    texture_request_profile_.pending_loads += pending_texture_loads.size();
+    texture_request_profile_.pending_ranges += pending_shared_memory_ranges.size();
+    for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
+      texture_request_profile_.pending_range_bytes += pending_range.length;
+    }
+  }
 
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
                     uint32_t(pending_texture_loads.size()));
@@ -563,29 +687,76 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
                     uint32_t(pending_shared_memory_ranges.size()));
 
   bool batched_shared_memory_request_succeeded = true;
+  uint64_t ranges_start_ns = 0;
+  if (profile_enabled) {
+    ranges_start_ns = TextureRequestProfileNowNs();
+  }
   std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
   if (!pending_shared_memory_ranges.empty()) {
+    if (profile_enabled) {
+      ++texture_request_profile_.request_ranges_calls;
+    }
     pending_shared_memory_range_pairs.reserve(pending_shared_memory_ranges.size());
     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
     }
+    SharedMemory::RequestRangesTelemetry telemetry;
     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
-        pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
+        pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size(),
+        profile_enabled ? &telemetry : nullptr);
+    if (profile_enabled) {
+      texture_request_profile_.merged_ranges += telemetry.merged_range_count;
+      texture_request_profile_.merged_range_bytes += telemetry.merged_bytes;
+      texture_request_profile_.all_valid_requests += telemetry.all_valid ? 1 : 0;
+      texture_request_profile_.upload_ranges += telemetry.upload_range_count;
+      texture_request_profile_.upload_bytes += telemetry.upload_bytes;
+      if (!batched_shared_memory_request_succeeded) {
+        ++texture_request_profile_.request_ranges_failures;
+      }
+    }
+  }
+  if (profile_enabled) {
+    texture_request_profile_.base_ranges_ns += TextureRequestProfileNowNs() - ranges_start_ns;
   }
 
+  uint64_t commit_start_ns = 0;
+  if (profile_enabled) {
+    commit_start_ns = TextureRequestProfileNowNs();
+  }
   if (batched_shared_memory_request_succeeded) {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+      if (profile_enabled) {
+        ++texture_request_profile_.committed_loads;
+      }
       CommitPreparedTextureLoad(pending_load);
     }
   } else {
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
       if (pending_load.texture != nullptr) {
+        if (profile_enabled) {
+          ++texture_request_profile_.fallback_loads;
+        }
         LoadTextureData(*pending_load.texture);
       }
     }
   }
+  if (profile_enabled) {
+    texture_request_profile_.base_commit_ns += TextureRequestProfileNowNs() - commit_start_ns;
+  }
   if (bindings_changed) {
+    uint64_t update_start_ns = 0;
+    if (profile_enabled) {
+      update_start_ns = TextureRequestProfileNowNs();
+      ++texture_request_profile_.binding_update_calls;
+      texture_request_profile_.binding_updates += TextureRequestProfileCountBits(bindings_changed);
+    }
     UpdateTextureBindingsImpl(bindings_changed);
+    if (profile_enabled) {
+      texture_request_profile_.base_update_ns += TextureRequestProfileNowNs() - update_start_ns;
+    }
+  }
+  if (profile_enabled) {
+    texture_request_profile_.base_total_ns += TextureRequestProfileNowNs() - total_start_ns;
   }
 }
 
@@ -1005,6 +1176,26 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
   }
   texture_bindings_in_sync_ &= ~bindings_reset;
   if (!from_destructor && bindings_reset) {
+    UpdateTextureBindingsImpl(bindings_reset);
+  }
+}
+
+void TextureCache::ResetOutdatedTextureBindings() {
+  uint32_t bindings_reset = 0;
+  for (size_t i = 0; i < texture_bindings_.size(); ++i) {
+    TextureBinding& binding = texture_bindings_[i];
+    if (!binding.key.is_valid) {
+      continue;
+    }
+    if ((!binding.texture || !binding.texture->outdated_mask()) &&
+        (!binding.texture_signed || !binding.texture_signed->outdated_mask())) {
+      continue;
+    }
+    binding.Reset();
+    bindings_reset |= UINT32_C(1) << i;
+  }
+  texture_bindings_in_sync_ &= ~bindings_reset;
+  if (bindings_reset) {
     UpdateTextureBindingsImpl(bindings_reset);
   }
 }

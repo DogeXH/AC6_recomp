@@ -147,6 +147,13 @@ class VulkanDevice {
     bool fragmentShaderSampleInterlock = false;
     bool fragmentShaderPixelInterlock = false;
 
+    // VK_KHR_fragment_shading_rate (#227). These are true only when the
+    // feature was enabled on the logical device. The rate-specific flag also
+    // requires the 2x2/sample2 property limits and a matching enumerated rate.
+
+    bool pipelineFragmentShadingRate = false;
+    bool fragmentShadingRate2x2Sample2 = false;
+
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 
     bool shaderDemoteToHelperInvocation = false;
@@ -182,6 +189,8 @@ class VulkanDevice {
   // `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
     bool ext_KHR_swapchain = false;                     // #2
+    // Has optional features and rate/sample-count requirements.
+    bool ext_KHR_fragment_shading_rate = false;         // #227
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147

@@ -121,7 +121,8 @@ ppc_u32_result_t keXamBuildResourceLocator(uint64_t module, std::u16string_view 
                                            std::u16string_view resource, ppc_pvoid_t buffer_ptr,
                                            uint32_t buffer_count) {
   std::u16string path;
-  if (!module) {
+  // The guest HMODULE is 32-bit; the register's upper half is not part of it.
+  if (!static_cast<uint32_t>(module)) {
     path = fmt::format(u"file://media:/{}.xzp#{}", container, resource);
     REXKRNL_DEBUG("XamBuildResourceLocator({0}) returning locator to local file {0}.xzp",
                   rex::string::to_utf8(container));

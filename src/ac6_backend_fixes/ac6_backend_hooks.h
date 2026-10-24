@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 #include <native/audio/audio_runtime.h>
 #include <rex/cvar.h>
 #include <rex/system/interfaces/graphics.h>
+#include <rex/ui/vulkan/api.h>
 
 #include "ac6_backend_capture_bridge.h"
 #include "ac6_backend_pass_classifier.h"
@@ -18,6 +20,15 @@ REXCVAR_DECLARE(bool, ac6_backend_signature_diagnostics);
 namespace ac6 {
 struct FrameStats;
 }
+
+namespace rex::graphics {
+class CommandProcessor;
+class RegisterFile;
+}  // namespace rex::graphics
+
+namespace rex::memory {
+class Memory;
+}  // namespace rex::memory
 
 namespace ac6::backend {
 
@@ -100,5 +111,55 @@ BackendDiagnosticsSnapshot GetDiagnosticsSnapshot();
 void ShutdownDiagnostics();
 
 const char* ToString(SwapSourceType swap_source);
+
+// Exact command-processor-side bridge for the experimental native renderer.
+// Unlike the guest D3D hooks, these callbacks run after the Vulkan backend has
+// decoded the PM4 command, so the register file and active shaders describe
+// the draw/copy being executed rather than an asynchronously earlier command.
+void NativeRendererOnGpuDraw(rex::graphics::CommandProcessor* command_processor,
+                             rex::graphics::RegisterFile* register_file,
+                             rex::memory::Memory* memory,
+                             uint32_t primitive_type,
+                             uint32_t index_count);
+bool NativeRendererOnGpuCopy(rex::graphics::CommandProcessor* command_processor,
+                             rex::graphics::RegisterFile* register_file,
+                             rex::memory::Memory* memory,
+                             uint32_t* written_address,
+                             uint32_t* written_length);
+void NativeRendererOnGpuSwap();
+
+inline constexpr size_t kNativeVulkanPipelineDescriptionSize = 58;
+
+struct NativeVulkanDrawRequest {
+  rex::graphics::CommandProcessor* command_processor = nullptr;
+  VkDevice device = VK_NULL_HANDLE;
+  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+  uint64_t pipeline_description_hash = 0;
+  // Byte-exact VulkanPipelineCache::PipelineDescription payload. Keeping this
+  // opaque avoids coupling the application hook ABI to SDK-private bitfields.
+  uint8_t pipeline_description[kNativeVulkanPipelineDescriptionSize] = {};
+  // Exact guest shader translations selected by VulkanPipelineCache.
+  // Non-owning; the SDK retains them until its pipeline cache shuts down.
+  VkShaderModule vertex_shader = VK_NULL_HANDLE;
+  VkShaderModule pixel_shader = VK_NULL_HANDLE;
+  // Non-owning module generated and retained by VulkanPipelineCache for the
+  // exact description above. Null exactly when that state has no GS stage.
+  VkShaderModule generated_geometry_shader = VK_NULL_HANDLE;
+  uint32_t host_vertex_shader_type = 0;
+  bool dynamic_rendering = false;
+  bool host_render_targets = false;
+  bool memexport_writes_possible = false;
+};
+
+struct NativeVulkanDrawPlan {
+  VkDevice device = VK_NULL_HANDLE;
+  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+bool NativeRendererSharedAuthorityEnabled();
+bool NativeRendererPrepareVulkanDraw(const NativeVulkanDrawRequest& request,
+                                     NativeVulkanDrawPlan& plan);
+void NativeRendererOnVulkanShutdown(VkDevice device);
 
 }  // namespace ac6::backend

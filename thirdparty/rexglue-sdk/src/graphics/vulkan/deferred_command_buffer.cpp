@@ -314,6 +314,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
       } break;
 
+      case Command::kVkWriteTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
+        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage,
+                                args.query_pool, args.query);
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;

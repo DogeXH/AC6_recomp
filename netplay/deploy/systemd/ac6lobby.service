@@ -1,0 +1,55 @@
+# systemd unit for ac6lobby, the AC6 recomp lobby server.
+# Installed by netplay/deploy/install.sh to /etc/systemd/system/ac6lobby.service.
+# Settings: /etc/default/ac6lobby (see ac6lobby.default). State: /var/lib/ac6lobby.
+# Admin: sudo ac6lobby admin players     Logs: journalctl -u ac6lobby
+[Unit]
+Description=AC6 recomp lobby server (ac6lobby)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Defaults; /etc/default/ac6lobby overrides them.
+Environment=AC6LOBBY_UDP=:47800
+Environment=AC6LOBBY_HTTP=127.0.0.1:47801
+Environment=AC6LOBBY_ADMIN=127.0.0.1:47802
+Environment=AC6LOBBY_ARGS=
+EnvironmentFile=-/etc/default/ac6lobby
+ExecStart=/usr/local/bin/ac6lobby -data /var/lib/ac6lobby -udp ${AC6LOBBY_UDP} -http ${AC6LOBBY_HTTP} -admin ${AC6LOBBY_ADMIN} $AC6LOBBY_ARGS
+# SIGTERM makes the server send the shutdown NOTICE to every client and write its state.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=2
+
+# A transient system user owns /var/lib/ac6lobby (really /var/lib/private/ac6lobby).
+DynamicUser=yes
+StateDirectory=ac6lobby
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening: the server needs UDP/TCP sockets and its state directory, nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

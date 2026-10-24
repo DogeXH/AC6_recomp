@@ -38,6 +38,11 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(vulkan_pipeline_fragment_shading_rate, false, "UI/Vulkan",
+                    "Enable VK_KHR_fragment_shading_rate for explicitly gated pipelines; "
+                    "unsupported devices retain normal per-fragment shading")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -143,6 +148,26 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   const bool get_physical_device_properties2_supported =
       vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2;
 
+#if defined(VK_KHR_fragment_shading_rate)
+  const bool fragment_shading_rate_requested =
+      with_gpu_emulation &&
+      REXCVAR_GET(vulkan_pipeline_fragment_shading_rate) &&
+      get_physical_device_properties2_supported &&
+      properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0);
+  if (with_gpu_emulation &&
+      REXCVAR_GET(vulkan_pipeline_fragment_shading_rate) &&
+      !fragment_shading_rate_requested) {
+    REXLOG_WARN(
+        "Vulkan pipeline fragment shading rate was requested, but Vulkan "
+        "1.2 and physical-device-properties2 are not both available");
+  }
+#else
+  if (with_gpu_emulation &&
+      REXCVAR_GET(vulkan_pipeline_fragment_shading_rate)) {
+    REXLOG_WARN("Vulkan headers do not expose VK_KHR_fragment_shading_rate");
+  }
+#endif
+
   // Name pointers from `requested_extensions` will be used in the enabled
   // extensions vector.
   std::unordered_map<std::string, bool*> requested_extensions;
@@ -217,6 +242,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {
+#if defined(VK_KHR_fragment_shading_rate)
+      if (fragment_shading_rate_requested) {
+        // #227. Pipeline-only use; no primitive or attachment rate is enabled.
+        XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
+      }
+#endif
       // #157.
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_sampler_ycbcr_conversion, 1, 1)
       // #198. Also must be enabled for VK_KHR_spirv_1_4.
@@ -279,6 +310,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+#if defined(VK_KHR_fragment_shading_rate)
+  if (fragment_shading_rate_requested &&
+      !device->extensions_.ext_KHR_fragment_shading_rate) {
+    REXLOG_WARN(
+        "Vulkan device '{}' lacks VK_KHR_fragment_shading_rate; explicitly "
+        "gated pipelines will retain normal shading",
+        properties.deviceName);
+  }
+#endif
+
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
     REXLOG_WARN("Vulkan device '{}' doesn't support swapchains", properties.deviceName);
     return nullptr;
@@ -315,6 +356,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
+#if defined(VK_KHR_fragment_shading_rate)
+  VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
+      features_KHR_fragment_shading_rate;
+  VkPhysicalDeviceFragmentShadingRatePropertiesKHR
+      properties_KHR_fragment_shading_rate = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+  bool fragment_shading_rate_properties_2x2_sample_2_supported = false;
+  bool fragment_shading_rate_2x2_sample_2_supported = false;
+#endif
   VulkanFeatures<VkPhysicalDeviceDynamicRenderingFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR>
       features_1_3_KHR_dynamic_rendering;
@@ -362,6 +413,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (ext_EXT_fragment_shader_interlock) {
       features_EXT_fragment_shader_interlock.Link(supported_features_2, device_create_info);
     }
+#if defined(VK_KHR_fragment_shading_rate)
+    if (device->extensions_.ext_KHR_fragment_shading_rate) {
+      features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
+      properties_KHR_fragment_shading_rate.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_KHR_fragment_shading_rate;
+    }
+#endif
     if (ext_EXT_non_seamless_cube_map) {
       features_EXT_non_seamless_cube_map.Link(supported_features_2, device_create_info);
     }
@@ -375,6 +433,71 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
+
+#if defined(VK_KHR_fragment_shading_rate)
+    if (device->extensions_.ext_KHR_fragment_shading_rate) {
+      // Both sample properties are maxima, so 2 must not exceed either one.
+      fragment_shading_rate_properties_2x2_sample_2_supported =
+          properties_KHR_fragment_shading_rate.maxFragmentSize.width >= 2 &&
+          properties_KHR_fragment_shading_rate.maxFragmentSize.height >= 2 &&
+          properties_KHR_fragment_shading_rate
+                  .maxFragmentShadingRateRasterizationSamples >=
+              VK_SAMPLE_COUNT_2_BIT &&
+          properties_KHR_fragment_shading_rate
+                  .maxFragmentShadingRateCoverageSamples >=
+              8;
+    }
+    if (device->extensions_.ext_KHR_fragment_shading_rate &&
+        features_KHR_fragment_shading_rate.supported
+            .pipelineFragmentShadingRate) {
+      const auto get_fragment_shading_rates =
+          reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
+              ifn.vkGetInstanceProcAddr(
+                  vulkan_instance->instance(),
+                  "vkGetPhysicalDeviceFragmentShadingRatesKHR"));
+      if (!get_fragment_shading_rates) {
+        REXLOG_WARN(
+            "VK_KHR_fragment_shading_rate is advertised, but its physical "
+            "device rate query is unavailable");
+      } else {
+        // A rate list can grow between the count and data calls. Retry a
+        // bounded number of times, and accept only a complete enumeration.
+        for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+          uint32_t rate_count = 0;
+          VkResult result = get_fragment_shading_rates(
+              physical_device, &rate_count, nullptr);
+          if ((result != VK_SUCCESS && result != VK_INCOMPLETE) ||
+              !rate_count) {
+            break;
+          }
+          std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(rate_count);
+          for (auto& rate : rates) {
+            rate.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR;
+          }
+          result = get_fragment_shading_rates(physical_device, &rate_count,
+                                              rates.data());
+          if (result == VK_INCOMPLETE) {
+            continue;
+          }
+          if (result != VK_SUCCESS || rate_count > rates.size()) {
+            break;
+          }
+          for (uint32_t rate_index = 0; rate_index < rate_count;
+               ++rate_index) {
+            const auto& rate = rates[rate_index];
+            if (rate.fragmentSize.width == 2 &&
+                rate.fragmentSize.height == 2 &&
+                (rate.sampleCounts & VK_SAMPLE_COUNT_2_BIT)) {
+              fragment_shading_rate_2x2_sample_2_supported = true;
+              break;
+            }
+          }
+          break;
+        }
+      }
+    }
+#endif
   }
 
   uint32_t queue_family_count = 0;
@@ -706,6 +829,29 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_EXT_fragment_shader_interlock, fragmentShaderPixelInterlock)
     }
   }
+
+#if defined(VK_KHR_fragment_shading_rate)
+  if (device->extensions_.ext_KHR_fragment_shading_rate) {
+    const bool enable_pipeline_fragment_shading_rate =
+        fragment_shading_rate_requested &&
+        features_KHR_fragment_shading_rate.supported
+            .pipelineFragmentShadingRate &&
+        fragment_shading_rate_properties_2x2_sample_2_supported &&
+        fragment_shading_rate_2x2_sample_2_supported;
+    features_KHR_fragment_shading_rate.enabled
+        .pipelineFragmentShadingRate =
+        enable_pipeline_fragment_shading_rate ? VK_TRUE : VK_FALSE;
+    // primitiveFragmentShadingRate and attachmentFragmentShadingRate stay
+    // disabled: the exact native pipeline uses only fixed pipeline state.
+    device->properties_.pipelineFragmentShadingRate =
+        enable_pipeline_fragment_shading_rate;
+    device->properties_.fragmentShadingRate2x2Sample2 =
+        enable_pipeline_fragment_shading_rate;
+    REXLOG_INFO("* pipelineFragmentShadingRate 2x2/sample2: {}",
+                enable_pipeline_fragment_shading_rate ? "enabled" :
+                                                        "unavailable");
+  }
+#endif
 
   if (ext_EXT_non_seamless_cube_map) {
     if (with_gpu_emulation) {

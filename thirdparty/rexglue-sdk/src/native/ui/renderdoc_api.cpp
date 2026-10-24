@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
+
 #include <rex/logging.h>
 #include <native/ui/renderdoc_api.h>
 
@@ -16,6 +18,15 @@ namespace rex {
 namespace ui {
 
 std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
+  // The Vulkan loader honors this variable for the implicit capture layer.
+  // Honor it here too so the explicit RenderDoc API probe below doesn't
+  // dlopen the capture library after the loader has intentionally skipped it.
+  const char* disable_renderdoc =
+      std::getenv("DISABLE_VULKAN_RENDERDOC_CAPTURE_1_36");
+  if (disable_renderdoc && disable_renderdoc[0] != '\0') {
+    return nullptr;
+  }
+
   std::unique_ptr<RenderDocAPI> renderdoc_api(new RenderDocAPI());
 
   pRENDERDOC_GetAPI get_api = nullptr;

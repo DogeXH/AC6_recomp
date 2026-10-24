@@ -1,0 +1,163 @@
+AC6 Recomp with netplay, Windows x64 build: third-party notices
+================================================================
+
+ac6recomp.exe is a single statically linked program. Besides the AC6 Recomp code itself
+(see LICENSE.txt, BSD 3-Clause, kept as published upstream), it contains the third-party
+components listed below. The full license text of each one is in the licenses/ folder next
+to this file. Versions are those of the source copies the exe was built from; where a commit
+is given, every compiled file of the vendored copy was checked byte-identical to that upstream
+commit.
+
+No game code or data is included in this notice set or in the release. You need your own
+copy of the game.
+
+
+1. LGPL components (statically linked)
+--------------------------------------
+
+This program uses the following libraries, which are covered by the GNU Lesser General
+Public License version 2.1 (licenses/FFmpeg-LGPL-2.1.txt, licenses/libmspack-LGPL-2.1.txt).
+They are linked statically into ac6recomp.exe and are unmodified.
+
+* FFmpeg 4.4 (Xenia's XMA fork), libavcodec + libavutil only
+  License:   GNU LGPL version 2.1 or later ("LGPL version 2.1 or later" per the build config)
+  Copyright: the FFmpeg developers (see the individual source files)
+  Upstream:  https://github.com/wmarti/FFmpeg, commit 0604b464c7cb4ebc94940cf1f324a3b26b87717c
+             (fork of https://ffmpeg.org/, release branch 4.4)
+  Built with: --disable-everything --disable-programs --disable-x86asm --disable-autodetect
+             --disable-network; decoders mp3, mp3float, wmav2, wmapro, xmaframes; parser
+             mpegaudio. CONFIG_GPL=0, CONFIG_NONFREE=0, CONFIG_VERSION3=0: no GPL or nonfree
+             part of FFmpeg is compiled in.
+  FFmpeg's own license overview: licenses/FFmpeg-LICENSE.md.txt.
+
+* libmspack (LZX decompressor only: mspack/lzxd.c and its headers)
+  License:   GNU LGPL version 2.1
+  Copyright: (C) 2003-2023 Stuart Caie
+  Upstream:  https://github.com/kyz/libmspack, commit 305907723a4e7ab2018e58040059ffb5e77db837
+             (the copy bundled with cabextract 1.11 in that repository; only LGPL files of
+             libmspack are compiled, none of cabextract's GPL code)
+
+Source code and relinking (LGPL 2.1, section 6):
+- The exact source of both libraries as built is in the AC6 Recomp source tree, directories
+  thirdparty/rexglue-sdk/thirdparty/FFmpeg and thirdparty/rexglue-sdk/thirdparty/libmspack,
+  with the build configuration in thirdparty/rexglue-sdk/thirdparty/CMakeLists.txt,
+  thirdparty/rexglue-sdk/thirdparty/ffmpeg-overlay and FFmpeg/config_windows_x86_64.h.
+  These directories are identical to upstream AC6 Recomp
+  https://github.com/sal063/AC6_recomp at commit 5d350c293a984b6a4e11c2759f1d09472c50a87e.
+- The complete source of this program (AC6 Recomp + ReXGlue SDK + netplay changes) is
+  available at:
+  Source for this build: <URL to be filled in before publishing>
+- To relink with a modified FFmpeg or libmspack: get that source, replace the library's
+  directory with your modified version, generate the recompiled game code from your own copy
+  of the game (it is produced from the game executable and cannot be distributed), and build
+  ac6recomp with the documented CMake presets (netplay/docs/BUILDING_WINDOWS.md; upstream's
+  setup_and_build.bat on Windows). The AC6 Recomp license permits modification and reverse
+  engineering for debugging such modifications.
+
+
+2. Other components (permissive licenses)
+-----------------------------------------
+
+Component                Version / commit                    License            licenses/ file
+---------------------------------------------------------------------------------------------------
+ReXGlue SDK              0.8.0 (vendored)                    BSD-3-Clause       ReXGlue-SDK.txt
+  Copyright (c) 2026, Tom Clay. Portions derived from Xenia: Copyright (c) 2022, Ben Vanik and
+  Xenia project contributors (BSD-3-Clause). Some guest layouts follow Xenia Canary (same
+  license). https://github.com/rexglue/rexglue-sdk , https://github.com/xenia-project/xenia
+  - freedreno instr-a2xx.h portions, Copyright (c) 2012 Rob Clark, MIT  freedreno-instr-a2xx.txt
+  - VIXL ARMv8 encoding constants, Copyright 2015 VIXL authors, BSD-3     VIXL.txt
+SDL                      3.5.0 (8bf3b7215ad9)                zlib               SDL3.txt
+  Copyright (C) 1997-2026 Sam Lantinga. https://github.com/libsdl-org/SDL
+  Bundled in SDL: hidapi (Signal 11 Software / libusb hidapi team, BSD option chosen)
+  SDL3-hidapi-BSD.txt; yuv2rgb (Copyright (c) 2016 Adrien Descamps, BSD-3) SDL3-yuv2rgb.txt;
+  fdlibm math (Copyright (C) 1993 Sun Microsystems) SDL3-fdlibm-notice.txt; dlmalloc (public
+  domain); OpenXR/Khronos headers (Apache-2.0 OR MIT).
+glslang                  11.0.0 (f4f1d8a352ca)               BSD-3 / BSD-2 /    glslang.txt
+  Copyright (C) 2002-2005 3Dlabs Inc. Ltd., (C) 2012-2016 LunarG,  MIT / Apache-2.0
+  Inc., (C) 2013-2016 Google, Inc. and others (see file).          (+ GPL-3 w/ Bison
+  https://github.com/KhronosGroup/glslang                          exception, parser)
+SPIRV-Tools              v2026.2-dev (04d0b166dcd6)          Apache-2.0         SPIRV-Tools-Apache-2.0.txt
+  Copyright (c) The Khronos Group Inc. and contributors. https://github.com/KhronosGroup/SPIRV-Tools
+SPIRV-Headers            04f10f650d51 (headers)              MIT (Khronos)      SPIRV-Headers.txt
+  Copyright (c) 2015-2024 The Khronos Group Inc. https://github.com/KhronosGroup/SPIRV-Headers
+Vulkan-Headers           1.4.343 (49f1a381e2ae, headers)     Apache-2.0 OR MIT  Vulkan-Headers.txt,
+  Copyright 2015-2023 The Khronos Group Inc. (MIT chosen)                       Vulkan-Headers-MIT.txt
+  https://github.com/KhronosGroup/Vulkan-Headers
+volk                     header 304 (0b17a763ba56)           MIT                volk.txt
+  Copyright (c) 2018-2024 Arseny Kapoulkine. https://github.com/zeux/volk
+Vulkan Memory Allocator  3.3.0 (1d8f600fd424)                MIT                VulkanMemoryAllocator.txt
+  Copyright (c) 2017-2025 Advanced Micro Devices, Inc.
+  https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+Dear ImGui               1.92.5 (6d910d5487d1)               MIT                imgui.txt
+  Copyright (c) 2014-2025 Omar Cornut. https://github.com/ocornut/imgui
+  - embedded ProggyClean.ttf font, Copyright (c) 2004, 2005 Tristan Grimmer, MIT
+                                                                                imgui-ProggyClean-notice.txt
+{fmt}                    12.1.0 (407c905e45ad)               MIT                fmt.txt
+  Copyright (c) 2012 - present, Victor Zverovich and {fmt} contributors. https://github.com/fmtlib/fmt
+spdlog                   1.17.0 (79524ddd08a4)               MIT                spdlog.txt
+  Copyright (c) 2016 - present, Gabi Melman and spdlog contributors. https://github.com/gabime/spdlog
+xxHash                   0.8.3 (e626a72bc232)                BSD-2-Clause       xxHash.txt
+  Copyright (c) 2012-2021 Yann Collet. https://github.com/Cyan4973/xxHash
+Snappy                   1.2.2 (6af9287fbdb9)                BSD-3-Clause       snappy.txt
+  Copyright 2011, Google Inc. https://github.com/google/snappy
+toml++                   3.4.0 (30172438cee6, header-only)   MIT                tomlplusplus.txt
+  Copyright (c) Mark Gillard. https://github.com/marzer/tomlplusplus
+CLI11                    2.6.1 (bfffd37e1f80, header-only)   BSD-3-Clause       CLI11.txt
+  Copyright (c) 2017-2025 University of Cincinnati, developed by Henry Schreiner.
+  https://github.com/CLIUtils/CLI11
+utfcpp                   4.0.9 (63d64de49fd6, header-only)   BSL-1.0            utfcpp-BSL-1.0.txt
+  Copyright 2006 Nemanja Trifunovic. https://github.com/nemtrif/utfcpp
+SIMDe                    0.8.2 (71fd833d9666, header-only)   MIT                simde.txt
+  Copyright (c) 2017 Evan Nemerson and SIMDe contributors. https://github.com/simd-everywhere/simde
+o1heap                   3.0.0 (388a73fd9007)                MIT                o1heap.txt
+  Copyright (c) 2020 Pavel Kirienko. https://github.com/pavel-kirienko/o1heap
+disruptorplus            vendored (header-only)              MIT                disruptorplus.txt
+  Copyright (c) Lewis Baker. https://github.com/lewissbaker/disruptorplus
+aes_128                  vendored                            MIT                aes_128.txt
+  Copyright (c) 2017 LuoPeng. https://github.com/openluopworld/aes_128
+cppDES                   vendored                            MIT                cppDES.txt
+  Copyright (c) 2014 Faraz Fallahi. https://github.com/fffaraz/cppDES
+TinySHA1                 vendored (modified by Xenia)        ISC-style          TinySHA1.txt
+  Copyright (c) 2012-22 Saurav Mohapatra. https://github.com/mohaps/TinySHA1
+SHA-256 (Stephan Brumme) vendored (modified by Xenia)        zlib               sha256-Brumme-zlib.txt
+  Copyright (c) 2014,2015 Stephan Brumme. https://create.stephan-brumme.com/hash-library/
+rijndael-alg-fst         3.0 (December 2000)                 public domain      rijndael-alg-fst.txt
+  Vincent Rijmen, Antoon Bosselaers, Paulo Barreto.
+PicoSHA2                 vendored (header-only)              MIT                picosha2.txt
+  Copyright (C) 2017 okdshin. https://github.com/okdshin/PicoSHA2
+RenderDoc in-app API     renderdoc_app.h (header-only)       MIT                renderdoc_app.txt
+  Copyright (c) 2015-2016 Baldur Karlsson. https://github.com/baldurk/renderdoc
+DirectX Shader Compiler  6b6f40200bea (API headers only)     NCSA               DirectXShaderCompiler-NCSA.txt
+  Copyright (C) Microsoft Corporation. https://github.com/microsoft/DirectXShaderCompiler
+DXBC checksum            DXBCChecksum.cpp (via Xenia)        see notice         DXBCChecksum-notice.txt
+  Copyright 2008-2016 (c), Advanced Micro Devices, Inc. (AMD Developer Tools Team)
+PE image structures      pe_image.h (via Xenia, header)      see notice         pe_image-notice.txt
+  Copyright (c) Microsoft Corporation.
+FFmpeg IJG DCT files     jfdctfst.c, jfdctint_template.c,    IJG                FFmpeg-IJG-notice.txt
+                         jrevdct.c (part of FFmpeg above)
+  This software is based in part on the work of the Independent JPEG Group.
+  faandct.c: Copyright (c) 2003 Michael Niedermayer, Roman Shaposhnik, ISC-style
+                                                                                FFmpeg-faandct-notice.txt
+
+Netplay (online play) components:
+Monocypher               4.0.2                               BSD-2-Clause OR    Monocypher.txt
+  Copyright (c) 2017-2023 Loup Vaillant, Michael Savage, CC0-1.0
+  Fabio Scotoni and contributors.
+  https://monocypher.org/
+KCP                      1.7 (38e0c9366e4a)                  MIT                KCP.txt
+  Copyright (c) 2017 Lin Wei (skywind3000). https://github.com/skywind3000/kcp
+nlohmann/json            3.11.3 (header-only)                MIT                nlohmann-json.txt
+  Copyright (c) 2013-2023 Niels Lohmann. https://github.com/nlohmann/json
+
+Toolchain runtime:
+Microsoft C/C++ runtime  MSVC 14.44.35220 (UCRT, vcruntime,  Microsoft          Microsoft-CRT.txt
+  and STL), statically linked     STL: Apache-2.0 WITH LLVM-exception
+                                                             Distributable Code
+
+
+3. Regenerating this file
+-------------------------
+
+netplay/release/update_licenses.sh [build dir] refreshes licenses/ from the source tree,
+lists the libraries on the ac6recomp.exe link line (and warns about unknown ones) and prints
+the version macros. See "Release notices" in netplay/docs/BUILDING_WINDOWS.md.

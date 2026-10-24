@@ -40,6 +40,9 @@ struct AudioDriverTelemetry {
   uint32_t peak_callback_produced_frames{0};
   uint32_t last_callback_duration_us{0};
   uint32_t peak_callback_duration_us{0};
+  uint32_t explicit_silence_submissions{0};
+  uint32_t zero_output_frames{0};
+  uint32_t nonzero_output_frames{0};
 };
 
 struct AudioFrame {

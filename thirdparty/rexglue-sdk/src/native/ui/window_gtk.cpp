@@ -19,6 +19,9 @@
 #include <gdk/gdkx.h>
 #include <xcb/xcb.h>
 
+REXCVAR_DECLARE(int32_t, window_x);
+REXCVAR_DECLARE(int32_t, window_y);
+
 namespace {
 
 uint32_t ResolveWindowWidth(uint32_t requested_width) {
@@ -381,6 +384,12 @@ bool GTKWindow::OpenImpl() {
       gtk_window_move(GTK_WINDOW(window_), geom.x + (geom.width - GetDesiredLogicalWidth()) / 2,
                       geom.y + (geom.height - GetDesiredLogicalHeight()) / 2);
     }
+  }
+
+  // Optional explicit placement (logical screen coordinates; Mac fork c3330607f). Used by
+  // multi-instance test setups so windows do not cover each other.
+  if (int32_t x = REXCVAR_GET(window_x), y = REXCVAR_GET(window_y); x >= 0 && y >= 0) {
+    gtk_window_move(GTK_WINDOW(window_), x, y);
   }
 
   // After setting up the initial layout for non-fullscreen, enter fullscreen if

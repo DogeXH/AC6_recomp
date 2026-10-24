@@ -36,3 +36,28 @@ catch_discover_tests(unit_tests
         LABELS "unit"
         TIMEOUT 60
 )
+
+add_executable(input_tests
+    input/input_test.cpp
+)
+
+target_include_directories(input_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(input_tests PRIVATE
+    rexinput
+    rexui
+    Catch2::Catch2WithMain
+)
+
+set_target_properties(input_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/bin
+)
+
+catch_discover_tests(input_tests
+    TEST_PREFIX "unit.input."
+    PROPERTIES
+        LABELS "unit;input"
+        TIMEOUT 60
+)

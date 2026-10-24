@@ -58,6 +58,53 @@ std::string FlagNameToEnvVar(std::string_view name) {
   return result;
 }
 
+bool ValidateConstraints(const FlagEntry& entry, std::string_view value);
+bool CanonicalizeFlagValue(const FlagEntry& entry, std::string_view value,
+                           std::string& canonical_value);
+
+// Apply a transient startup value without making it part of the persisted
+// user configuration. The source ordering makes precedence independent of
+// the order in which startup helpers happen to be called.
+bool ApplyLaunchOverride(FlagEntry& entry, std::string_view value,
+                         LaunchOverrideSource source) {
+  if (source < entry.launch_override_source) {
+    return true;
+  }
+  std::string canonical_value;
+  if (!CanonicalizeFlagValue(entry, value, canonical_value) ||
+      !entry.setter(value)) {
+    return false;
+  }
+  entry.launch_override_source = source;
+  return true;
+}
+
+enum class ConfigOverrideResult { kNotOverridden, kRecorded, kRejected };
+
+// Preserve the live launch override while still recording a valid TOML value
+// as the user's saved preference. Canonicalization type-parses without ever
+// writing the lower-priority value to live storage.
+ConfigOverrideResult RecordConfigValueOverriddenByLaunch(
+    const std::string& name, const std::string& value) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(name);
+  if (it == GetRegistryIndex().end()) {
+    return ConfigOverrideResult::kNotOverridden;
+  }
+  auto& entry = GetRegistryStorage()[it->second];
+  if (entry.launch_override_source == LaunchOverrideSource::kNone) {
+    return ConfigOverrideResult::kNotOverridden;
+  }
+
+  std::string canonical_value;
+  if (!CanonicalizeFlagValue(entry, value, canonical_value)) {
+    return ConfigOverrideResult::kRejected;
+  }
+  entry.user_set = true;
+  entry.user_value = std::move(canonical_value);
+  return ConfigOverrideResult::kRecorded;
+}
+
 // Recursively apply TOML values
 void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
   for (const auto& [key, value] : table) {
@@ -80,10 +127,21 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
         continue;
       }
 
-      if (SetFlagByName(full_key, value_str)) {
-        REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
-      } else {
-        REXLOG_WARN("Config: unknown cvar '{}'", full_key);
+      switch (RecordConfigValueOverriddenByLaunch(full_key, value_str)) {
+        case ConfigOverrideResult::kRecorded:
+          REXLOG_DEBUG("Config: {} = {} (per-launch override takes precedence)", full_key,
+                       value_str);
+          break;
+        case ConfigOverrideResult::kRejected:
+          REXLOG_WARN("Config: invalid value for cvar '{}'", full_key);
+          break;
+        case ConfigOverrideResult::kNotOverridden:
+          if (SetFlagByName(full_key, value_str)) {
+            REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
+          } else {
+            REXLOG_WARN("Config: unknown or invalid cvar '{}'", full_key);
+          }
+          break;
       }
     }
   }
@@ -161,6 +219,78 @@ bool ValidateConstraints(const FlagEntry& entry, std::string_view value) {
   }
 
   return true;
+}
+
+bool CanonicalizeFlagValue(const FlagEntry& entry, std::string_view value,
+                           std::string& canonical_value) {
+  if (!ValidateConstraints(entry, value)) {
+    return false;
+  }
+
+  const char* begin = value.data();
+  const char* end = begin + value.size();
+  switch (entry.type) {
+    case FlagType::Boolean:
+      if (value == "true" || value == "1" || value == "yes") {
+        canonical_value = "true";
+        return true;
+      }
+      if (value == "false" || value == "0" || value == "no") {
+        canonical_value = "false";
+        return true;
+      }
+      return false;
+    case FlagType::Int32: {
+      int32_t parsed = 0;
+      auto [ptr, ec] = std::from_chars(begin, end, parsed);
+      if (ec != std::errc() || ptr != end) {
+        return false;
+      }
+      canonical_value = std::to_string(parsed);
+      return true;
+    }
+    case FlagType::Int64: {
+      int64_t parsed = 0;
+      auto [ptr, ec] = std::from_chars(begin, end, parsed);
+      if (ec != std::errc() || ptr != end) {
+        return false;
+      }
+      canonical_value = std::to_string(parsed);
+      return true;
+    }
+    case FlagType::Uint32: {
+      uint32_t parsed = 0;
+      auto [ptr, ec] = std::from_chars(begin, end, parsed);
+      if (ec != std::errc() || ptr != end) {
+        return false;
+      }
+      canonical_value = std::to_string(parsed);
+      return true;
+    }
+    case FlagType::Uint64: {
+      uint64_t parsed = 0;
+      auto [ptr, ec] = std::from_chars(begin, end, parsed);
+      if (ec != std::errc() || ptr != end) {
+        return false;
+      }
+      canonical_value = std::to_string(parsed);
+      return true;
+    }
+    case FlagType::Double: {
+      double parsed = 0.0;
+      if (!ParseDouble(value, parsed)) {
+        return false;
+      }
+      canonical_value = std::to_string(parsed);
+      return true;
+    }
+    case FlagType::String:
+      canonical_value = std::string(value);
+      return true;
+    case FlagType::Command:
+      return false;
+  }
+  return false;
 }
 
 // Caller holds the registry mutex (recursive, so callbacks may re-enter).
@@ -591,11 +721,17 @@ std::vector<std::string> Init(int argc, char** argv) {
     if (entry.type == FlagType::Boolean) {
       app.add_flag_function(
           "--" + entry.name + ",!--no-" + entry.name,
-          [&entry](int64_t count) { entry.setter(count > 0 ? "true" : "false"); },
+          [&entry](int64_t count) {
+            ApplyLaunchOverride(entry, count > 0 ? "true" : "false",
+                                LaunchOverrideSource::kCommandLine);
+          },
           entry.description);
     } else {
       app.add_option_function<std::string>(
-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
+          "--" + entry.name,
+          [&entry](const std::string& val) {
+            ApplyLaunchOverride(entry, val, LaunchOverrideSource::kCommandLine);
+          },
           entry.description);
     }
   }
@@ -628,11 +764,11 @@ void LoadConfig(const std::filesystem::path& config_path) {
 
 void ApplyEnvironment() {
   int count = 0;
-  for (const auto& entry : GetRegistryStorage()) {
+  for (auto& entry : GetRegistryStorage()) {
     std::string env_name = FlagNameToEnvVar(entry.name);
     const char* env_value = std::getenv(env_name.c_str());
     if (env_value != nullptr) {
-      if (entry.setter(env_value)) {
+      if (ApplyLaunchOverride(entry, env_value, LaunchOverrideSource::kEnvironment)) {
         REXLOG_DEBUG("Env: {} = {} (from {})", entry.name, env_value, env_name);
         ++count;
       } else {
@@ -697,6 +833,7 @@ void ResetAllForTesting() {
       entry.has_session_default = false;
       entry.session_default.clear();
       entry.session_driver.clear();
+      entry.launch_override_source = LaunchOverrideSource::kNone;
     }
   }
   ClearPendingRestartFlags();

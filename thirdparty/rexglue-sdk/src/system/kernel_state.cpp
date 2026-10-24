@@ -33,6 +33,10 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if REX_HAVE_AC6NET
+#include "../kernel/xam/netplay_glue.h"
+#endif
+
 namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
@@ -56,6 +60,10 @@ KernelState::KernelState(memory::Memory* memory, runtime::FunctionDispatcher* fu
     user_data_root = std::filesystem::absolute(user_data_root);
   }
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+#if REX_HAVE_AC6NET
+  // This SDK keeps user_data_root in Runtime only; the glue needs it for <root>/netplay.
+  rex::netplay::SetUserDataRoot(user_data_root);
+#endif
 
   // Allocate KernelGuestGlobals early so xboxkrnl module can wire exports.
   kernel_guest_globals_ = memory_->SystemHeapAlloc(sizeof(KernelGuestGlobals));
@@ -138,6 +146,10 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
+#if REX_HAVE_AC6NET
+  // Stop the netplay glue workers (they dispatch into the app manager) and ac6net first.
+  rex::netplay::Shutdown();
+#endif
   SetExecutableModule(nullptr);
 
   if (dispatch_thread_running_) {
@@ -591,6 +603,11 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module,
     dispatch_thread_->set_name("Kernel Dispatch");
     dispatch_thread_->Create();
   }
+
+#if REX_HAVE_AC6NET
+  // Once per process, now that the XEX execution info (media ID, version) is readable.
+  rex::netplay::Startup(this);
+#endif
 }
 
 void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {
@@ -814,6 +831,12 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(0x00000013, 0);
     listener->EnqueueNotification(0x00000013, 0);
   }
+
+#if REX_HAVE_AC6NET
+  // Live-mask listeners learn the current Live connection state (ARCHITECTURE.md 5.1; Xenia
+  // Netplay kernel_state.cc:1092-1107 notes 4E4D07D3 gets stuck in online menus without it).
+  rex::netplay::OnNotifyListenerRegistered(listener);
+#endif
 }
 
 void KernelState::UnregisterNotifyListener(XNotifyListener* listener) {
@@ -846,11 +869,19 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error, uint32_t length) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+  // AC6 leaves unused XOVERLAPPED fields filled with its 0xFE allocation
+  // pattern and polls the result directly. Snapshot the notification fields
+  // before publishing the result (the guest may free the structure as soon as
+  // it observes completion), and never interpret the fill pattern as a real
+  // event handle or completion routine.
+  const X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  const uint32_t completion_routine = XOverlappedGetCompletionRoutine(ptr);
+  const X_HANDLE thread_handle = XOverlappedGetContext(ptr);
+
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
-  X_HANDLE event_handle = XOverlappedGetEvent(ptr);
-  if (event_handle) {
+  if (event_handle && event_handle != 0xFEFEFEFEu) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     if (!ev) {
       REXSYS_WARN("CompleteOverlappedEx: missing XEvent for handle {:08X}",
@@ -859,13 +890,11 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
       ev->Set(0, false);
     }
   }
-  if (XOverlappedGetCompletionRoutine(ptr)) {
-    X_HANDLE thread_handle = XOverlappedGetContext(ptr);
+  if (completion_routine && completion_routine != 0xFEFEFEFEu) {
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
-      uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
-      thread->EnqueueApc(routine, result, length, overlapped_ptr);
+      thread->EnqueueApc(completion_routine, result, length, overlapped_ptr);
     }
   }
 }

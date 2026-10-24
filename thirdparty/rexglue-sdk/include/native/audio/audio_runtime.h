@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
 #include <atomic>
 #include <array>
 #include <cstddef>
@@ -120,6 +122,9 @@ class AudioRuntime {
   std::unique_ptr<rex::thread::Thread> worker_thread_;
   system::object_ref<system::XThread> worker_thread_context_;
   std::unique_ptr<rex::thread::Event> worker_wake_event_;
+  std::mutex worker_wake_mutex_;
+  std::condition_variable worker_wake_cv_;
+  bool worker_wake_pending_ = false;
   std::unique_ptr<rex::thread::Event> shutdown_event_;
   uint64_t tick_counter_{0};
   uint32_t peak_queued_frames_{0};

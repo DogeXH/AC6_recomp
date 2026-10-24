@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <utility>
@@ -94,6 +95,21 @@ namespace shaders {
 }  // namespace shaders
 
 namespace {
+
+uint64_t TextureRequestProfileNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+uint32_t TextureRequestProfileCountBits(uint32_t value) {
+  uint32_t count = 0;
+  while (value) {
+    value &= value - 1;
+    ++count;
+  }
+  return count;
+}
 
 // Keep invalid fetch constant texture reads aligned with D3D12 null SRV
 // descriptors, which force all sampled channels to 0.
@@ -550,6 +566,70 @@ void VulkanTextureCache::EndFrame() {
                  unsupported_features & kUnsupportedSnormBit ? " signed" : "");
     unsupported_format_features_used_[i] = 0;
   }
+
+  if (texture_request_profile_enabled_) {
+    const TextureRequestProfile& profile = texture_request_profile_;
+    auto ns_to_ms = [](uint64_t ns) { return double(ns) / 1000000.0; };
+    auto remainder = [](uint64_t total, uint64_t accounted) {
+      return total > accounted ? total - accounted : 0;
+    };
+    uint64_t base_accounted_ns =
+        profile.base_invalidation_ns + profile.base_binding_ns + profile.base_lookup_ns +
+        profile.base_prepare_ns + profile.base_ranges_ns + profile.base_commit_ns +
+        profile.base_update_ns;
+    uint64_t vulkan_accounted_ns =
+        profile.vulkan_base_ns + profile.vulkan_3d_ns + profile.vulkan_usage_ns;
+    if (profile.vulkan_calls) {
+      REXGPU_INFO(
+          "[AC6_TEXREQ] frame={} calls={} nonzero={} zero={} requested={} base_calls={} "
+          "out_of_sync={} parsed={} invalid={} outdated={} invalidated_in_sync={}",
+          texture_request_profile_frame_index_, profile.vulkan_calls,
+          profile.vulkan_calls - profile.vulkan_zero_mask_calls, profile.vulkan_zero_mask_calls,
+          profile.requested_bindings, profile.base_calls, profile.out_of_sync_bindings,
+          profile.parsed_bindings, profile.invalid_fetches, profile.outdated_signals,
+          profile.invalidated_bindings);
+      REXGPU_INFO(
+          "[AC6_TEXREQ] frame={} lookup={} null={} created={} prepare={} dedup={} "
+          "pending_loads={} pending_ranges={} pending_mb={:.3f} range_calls={} range_fail={} "
+          "merged={} merged_mb={:.3f} all_valid={} upload_ranges={} upload_mb={:.3f} "
+          "commit={} fallback={} update_calls={} update_slots={}",
+          texture_request_profile_frame_index_, profile.texture_lookups,
+          profile.texture_lookup_nulls, profile.textures_created, profile.prepare_calls,
+          profile.prepare_dedup_hits, profile.pending_loads, profile.pending_ranges,
+          double(profile.pending_range_bytes) / (1024.0 * 1024.0),
+          profile.request_ranges_calls, profile.request_ranges_failures, profile.merged_ranges,
+          double(profile.merged_range_bytes) / (1024.0 * 1024.0),
+          profile.all_valid_requests, profile.upload_ranges,
+          double(profile.upload_bytes) / (1024.0 * 1024.0), profile.committed_loads,
+          profile.fallback_loads, profile.binding_update_calls, profile.binding_updates);
+      REXGPU_INFO(
+          "[AC6_TEXREQ] frame={} wrapper_3d_visits={} wrapper_3d_views={} usage_visits={} "
+          "usage_valid={} usage_textures={} transitions={}",
+          texture_request_profile_frame_index_, profile.wrapper_3d_binding_visits,
+          profile.wrapper_3d_view_requests, profile.usage_binding_visits,
+          profile.usage_valid_bindings, profile.usage_texture_objects,
+          profile.usage_transitions);
+      REXGPU_INFO(
+          "[AC6_TEXREQ] frame={} base_ms total={:.3f} invalidate={:.3f} bind_parse={:.3f} "
+          "lookup={:.3f} prepare={:.3f} ranges={:.3f} commit={:.3f} update={:.3f} "
+          "other={:.3f}",
+          texture_request_profile_frame_index_, ns_to_ms(profile.base_total_ns),
+          ns_to_ms(profile.base_invalidation_ns), ns_to_ms(profile.base_binding_ns),
+          ns_to_ms(profile.base_lookup_ns), ns_to_ms(profile.base_prepare_ns),
+          ns_to_ms(profile.base_ranges_ns), ns_to_ms(profile.base_commit_ns),
+          ns_to_ms(profile.base_update_ns),
+          ns_to_ms(remainder(profile.base_total_ns, base_accounted_ns)));
+      REXGPU_INFO(
+          "[AC6_TEXREQ] frame={} vulkan_ms total={:.3f} base={:.3f} wrapper_3d={:.3f} "
+          "usage={:.3f} other={:.3f}",
+          texture_request_profile_frame_index_, ns_to_ms(profile.vulkan_total_ns),
+          ns_to_ms(profile.vulkan_base_ns), ns_to_ms(profile.vulkan_3d_ns),
+          ns_to_ms(profile.vulkan_usage_ns),
+          ns_to_ms(remainder(profile.vulkan_total_ns, vulkan_accounted_ns)));
+    }
+    texture_request_profile_ = {};
+    ++texture_request_profile_frame_index_;
+  }
 }
 
 void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -557,13 +637,47 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  const bool profile_enabled = texture_request_profile_enabled_;
+  if (profile_enabled) {
+    ++texture_request_profile_.vulkan_calls;
+    texture_request_profile_.requested_bindings +=
+        TextureRequestProfileCountBits(used_texture_mask);
+  }
+
+  // There are no binding, residency, lifetime or image-layout obligations for
+  // a draw whose translated shaders sample no textures. If a watched texture
+  // became outdated, keep the notification pending until a later textured
+  // draw actually needs to observe it.
+  if (used_texture_mask == 0) {
+    if (profile_enabled) {
+      ++texture_request_profile_.vulkan_zero_mask_calls;
+    }
+    return;
+  }
+
+  uint64_t total_start_ns = 0;
+  uint64_t base_start_ns = 0;
+  if (profile_enabled) {
+    total_start_ns = TextureRequestProfileNowNs();
+    base_start_ns = total_start_ns;
+  }
   TextureCache::RequestTextures(used_texture_mask);
+  if (profile_enabled) {
+    texture_request_profile_.vulkan_base_ns += TextureRequestProfileNowNs() - base_start_ns;
+  }
 
   // Pre-create 3D-as-2D wrappers while still in texture request phase.
+  uint64_t wrapper_3d_start_ns = 0;
+  if (profile_enabled) {
+    wrapper_3d_start_ns = TextureRequestProfileNowNs();
+  }
   if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
     uint32_t textures_3d = used_texture_mask;
     uint32_t index_3d;
     while (rex::bit_scan_forward(textures_3d, &index_3d)) {
+      if (profile_enabled) {
+        ++texture_request_profile_.wrapper_3d_binding_visits;
+      }
       textures_3d &= ~(uint32_t(1) << index_3d);
       const TextureBinding* binding = GetValidTextureBinding(index_3d);
       if (!binding || binding->key.dimension != xenos::DataDimension::k3D) {
@@ -571,16 +685,30 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
       VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
       if (texture) {
+        if (profile_enabled) {
+          ++texture_request_profile_.wrapper_3d_view_requests;
+        }
         texture->GetOrCreate3DAs2DImageView(false, binding->host_swizzle);
       }
       VulkanTexture* texture_signed = static_cast<VulkanTexture*>(binding->texture_signed);
       if (texture_signed) {
+        if (profile_enabled) {
+          ++texture_request_profile_.wrapper_3d_view_requests;
+        }
         texture_signed->GetOrCreate3DAs2DImageView(true, binding->host_swizzle);
       }
     }
   }
+  if (profile_enabled) {
+    texture_request_profile_.vulkan_3d_ns +=
+        TextureRequestProfileNowNs() - wrapper_3d_start_ns;
+  }
 
   // Transition the textures into the needed usage.
+  uint64_t usage_start_ns = 0;
+  if (profile_enabled) {
+    usage_start_ns = TextureRequestProfileNowNs();
+  }
   VkPipelineStageFlags dst_stage_mask;
   VkAccessFlags dst_access_mask;
   VkImageLayout new_layout;
@@ -589,18 +717,30 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   uint32_t textures_remaining = used_texture_mask;
   uint32_t index;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
+    if (profile_enabled) {
+      ++texture_request_profile_.usage_binding_visits;
+    }
     textures_remaining &= ~(uint32_t(1) << index);
     const TextureBinding* binding = GetValidTextureBinding(index);
     if (!binding) {
       continue;
     }
+    if (profile_enabled) {
+      ++texture_request_profile_.usage_valid_bindings;
+    }
     VulkanTexture* binding_texture = static_cast<VulkanTexture*>(binding->texture);
     if (binding_texture != nullptr) {
+      if (profile_enabled) {
+        ++texture_request_profile_.usage_texture_objects;
+      }
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
       VulkanTexture::Usage old_usage =
           binding_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
+        if (profile_enabled) {
+          ++texture_request_profile_.usage_transitions;
+        }
         VkPipelineStageFlags src_stage_mask;
         VkAccessFlags src_access_mask;
         VkImageLayout old_layout;
@@ -613,10 +753,16 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     VulkanTexture* binding_texture_signed = static_cast<VulkanTexture*>(binding->texture_signed);
     if (binding_texture_signed != nullptr) {
+      if (profile_enabled) {
+        ++texture_request_profile_.usage_texture_objects;
+      }
       binding_texture_signed->MarkAsUsed();
       VulkanTexture::Usage old_usage =
           binding_texture_signed->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
+        if (profile_enabled) {
+          ++texture_request_profile_.usage_transitions;
+        }
         VkPipelineStageFlags src_stage_mask;
         VkAccessFlags src_access_mask;
         VkImageLayout old_layout;
@@ -627,6 +773,10 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
                                                   dst_access_mask, old_layout, new_layout);
       }
     }
+  }
+  if (profile_enabled) {
+    texture_request_profile_.vulkan_usage_ns += TextureRequestProfileNowNs() - usage_start_ns;
+    texture_request_profile_.vulkan_total_ns += TextureRequestProfileNowNs() - total_start_ns;
   }
 }
 
@@ -1741,6 +1891,16 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
+  } else {
+    // Same layout/usage but another upload may have written the image earlier
+    // in this submission - emit a TRANSFER_WRITE -> TRANSFER_WRITE barrier so
+    // the next CmdCopyBufferToImage is ordered after any prior copy.
+    command_processor_.PushImageMemoryBarrier(
+        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
   }
   command_processor_.SubmitBarriers(true);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(

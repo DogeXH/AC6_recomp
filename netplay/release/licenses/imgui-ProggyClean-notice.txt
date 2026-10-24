@@ -1,0 +1,7 @@
+(Extracted from thirdparty/rexglue-sdk/thirdparty/imgui/imgui_draw.cpp, lines 6163-6167.)
+
+//-----------------------------------------------------------------------------
+// ProggyClean.ttf
+// Copyright (c) 2004, 2005 Tristan Grimmer
+// MIT license (see License.txt in http://www.proggyfonts.net/index.php?menu=download)
+// Download and more information at http://www.proggyfonts.net or http://upperboundsinteractive.com/fonts.php

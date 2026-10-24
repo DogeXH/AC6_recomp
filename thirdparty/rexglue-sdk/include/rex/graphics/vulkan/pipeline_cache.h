@@ -13,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -49,6 +50,14 @@ class VulkanPipelineCache {
  public:
   static constexpr size_t kLayoutUIDEmpty = 0;
 
+  // Stable, opaque copy of the byte-exact pipeline description used as the
+  // persistent-cache key. Keep this payload opaque outside the pipeline cache
+  // so private enums and bitfields don't become part of the public API.
+  struct PipelineDescriptionExport {
+    static constexpr size_t kSize = 58;
+    uint8_t bytes[kSize] = {};
+  };
+
   class PipelineLayoutProvider {
    public:
     virtual ~PipelineLayoutProvider() {}
@@ -56,6 +65,20 @@ class VulkanPipelineCache {
 
    protected:
     PipelineLayoutProvider() = default;
+  };
+
+  // Everything an external renderer needs to reproduce the SDK pipeline
+  // selection without inserting into pipelines_ or creating a graphics PSO.
+  // All Vulkan handles are borrowed and remain owned by the SDK.
+  struct ExternalPipelineDescription {
+    uint64_t hash = 0;
+    PipelineDescriptionExport description = {};
+    const PipelineLayoutProvider* layout = nullptr;
+    // Exact guest-shader modules used by the live SDK translation. Borrowed;
+    // VulkanPipelineCache retains ownership for its entire active lifetime.
+    VkShaderModule vertex_shader = VK_NULL_HANDLE;
+    VkShaderModule pixel_shader = VK_NULL_HANDLE;
+    VkShaderModule generated_geometry_shader = VK_NULL_HANDLE;
   };
 
   VulkanPipelineCache(VulkanCommandProcessor& command_processor, const RegisterFile& register_file,
@@ -86,13 +109,26 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  bool DescribePipelineForExternalUse(
+      VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      ExternalPipelineDescription& description_out);
   // TODO(Triang3l): Return a deferred creation handle.
+  // generated_geometry_shader_out is an optional non-owning export of the
+  // SDK-generated geometry shader for the exact PipelineDescription. The
+  // pipeline cache retains ownership of the module.
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
+      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr,
+      uint64_t* description_hash_out = nullptr,
+      PipelineDescriptionExport* description_export_out = nullptr,
+      VkShaderModule* generated_geometry_shader_out = nullptr);
   bool IsCreatingPipelines() const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
@@ -341,6 +377,19 @@ class VulkanPipelineCache {
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
       VulkanRenderTargetCache::RenderPassKey render_pass_key,
       PipelineDescription& description_out) const;
+  bool PreparePipelineDescription(
+      VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      PipelineDescription& description_out);
+  bool GetGeneratedGeometryShaderForDescription(
+      const PipelineDescription& description,
+      VkShaderModule& generated_geometry_shader_out);
+  const PipelineLayoutProvider* GetPipelineLayoutForShaders(
+      const VulkanShader::VulkanTranslation* vertex_shader,
+      const VulkanShader::VulkanTranslation* pixel_shader);
 
   // Whether the pipeline for the given description is supported by the device.
   bool ArePipelineRequirementsMet(const PipelineDescription& description) const;

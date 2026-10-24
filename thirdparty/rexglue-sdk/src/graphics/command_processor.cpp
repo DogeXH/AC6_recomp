@@ -9,10 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -34,6 +36,11 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_STRING(
+    trace_gpu_capture_marker, "", "GPU",
+    "Capture one self-contained GPU frame after this marker file is created. "
+    "The marker is consumed at a swap boundary and trace_gpu_prefix selects the output directory.");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -431,7 +438,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // Per-write GetRegisterInfo was a 600-case switch (each case with a
+  // static-init guard) on the hottest CP path, only to feed a debug log.
+  // One-time bitmap, O(1) per write.
+  static const auto known_register = [] {
+    std::array<bool, RegisterFile::kRegisterCount> known{};
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      known[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
+    }
+    return known;
+  }();
+  if (!known_register[index]) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -818,10 +835,23 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+  if (!write_one_reg) {
+    // Bulk range write instead of a virtual WriteRegister call per dword.
+    // Backends can then take fast paths for whole ranges (the Vulkan
+    // WriteRegistersFromMem override copy_and_swaps ranges fully inside the
+    // shader constant blocks). Ranges that touch registers with write side
+    // effects (scratch writeback, COHER_STATUS_HOST, DC_LUT_*) are outside
+    // those blocks and fall back to per-register WriteRegister inside the
+    // base WriteRegistersFromMem, preserving all special-case handling.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+  } else {
+    // Repeated write to a single register - each write must observe its own
+    // side effects (DC_LUT_SEQ_COLOR / DC_LUT_PWL_DATA streaming relies on
+    // per-write component index advancement), so keep the per-dword path.
+    for (uint32_t m = 0; m < count; m++) {
+      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+      WriteRegister(base_index, reg_data);
+    }
   }
 
   trace_writer_.WritePacketEnd();
@@ -1017,6 +1047,27 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   trace_writer_.WritePacketEnd();
   if (opcode == PM4_XE_SWAP) {
+    // Allow an unattended benchmark controller to capture the exact next
+    // frame after gameplay is known to be running. This is intentionally
+    // marker-driven rather than swap-count-driven: startup movies and shader
+    // compilation make absolute frame numbers unstable between builds.
+    if (trace_state_ == TraceState::kDisabled) {
+      const std::filesystem::path capture_marker =
+          REXCVAR_GET(trace_gpu_capture_marker);
+      if (!capture_marker.empty()) {
+        std::error_code marker_error;
+        if (std::filesystem::is_regular_file(capture_marker, marker_error)) {
+          if (std::filesystem::remove(capture_marker, marker_error)) {
+            REXGPU_INFO("Consumed GPU frame capture marker {}", capture_marker.string());
+            RequestFrameTrace(REXCVAR_GET(trace_gpu_prefix));
+          } else {
+            REXGPU_WARN("Unable to consume GPU frame capture marker {}: {}",
+                        capture_marker.string(), marker_error.message());
+          }
+        }
+      }
+    }
+
     // End the trace writer frame.
     if (trace_writer_.is_open()) {
       trace_writer_.WriteEvent(EventCommand::Type::kSwap);

@@ -1,0 +1,42 @@
+# ac6lobby with Docker Compose. From this directory:
+#   docker compose up -d --build
+#   docker compose logs ac6lobby | grep "server public key"
+#   docker compose exec ac6lobby /ac6lobby admin players
+#
+# State (server key, accounts, stats, bans, admin token) lives in the named volume
+# "ac6lobby-data". Back it up; see netplay/docs/HOSTING_A_SERVER.md.
+services:
+  ac6lobby:
+    build:
+      context: ../server
+      dockerfile: ../deploy/Dockerfile
+      args:
+        VERSION: compose
+    image: ac6lobby:latest
+    container_name: ac6lobby
+    restart: unless-stopped
+    ports:
+      - "47800:47800/udp"
+      # Public status page (counts only). Uncomment, and use the "-http", ":47801" command below.
+      # - "47801:47801/tcp"
+    command: ["-http", "127.0.0.1:47801", "-log-format", "json"]
+    # command: ["-http", ":47801", "-log-format", "json"]
+    volumes:
+      - ac6lobby-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ac6lobby-data:

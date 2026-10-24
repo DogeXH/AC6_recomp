@@ -128,7 +128,7 @@ void TraceWriter::WriteIndirectBufferEnd() {
   fwrite(&cmd, 1, sizeof(cmd), file_);
 }
 
-void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
+void TraceWriter::WritePacketStartImpl(uint32_t base_ptr, uint32_t count) {
   if (!file_) {
     return;
   }
@@ -141,7 +141,7 @@ void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
   fwrite(membase_ + base_ptr, 4, count, file_);
 }
 
-void TraceWriter::WritePacketEnd() {
+void TraceWriter::WritePacketEndImpl() {
   if (!file_) {
     return;
   }
@@ -151,14 +151,14 @@ void TraceWriter::WritePacketEnd() {
   fwrite(&cmd, 1, sizeof(cmd), file_);
 }
 
-void TraceWriter::WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr) {
+void TraceWriter::WriteMemoryReadImpl(uint32_t base_ptr, size_t length, const void* host_ptr) {
   if (!file_) {
     return;
   }
   WriteMemoryCommand(TraceCommandType::kMemoryRead, base_ptr, length, host_ptr);
 }
 
-void TraceWriter::WriteMemoryReadCached(uint32_t base_ptr, size_t length) {
+void TraceWriter::WriteMemoryReadCachedImpl(uint32_t base_ptr, size_t length) {
   if (!file_) {
     return;
   }
@@ -171,7 +171,7 @@ void TraceWriter::WriteMemoryReadCached(uint32_t base_ptr, size_t length) {
   }
 }
 
-void TraceWriter::WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length) {
+void TraceWriter::WriteMemoryReadCachedNopImpl(uint32_t base_ptr, size_t length) {
   if (!file_) {
     return;
   }
@@ -183,7 +183,7 @@ void TraceWriter::WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length) {
   }
 }
 
-void TraceWriter::WriteMemoryWrite(uint32_t base_ptr, size_t length, const void* host_ptr) {
+void TraceWriter::WriteMemoryWriteImpl(uint32_t base_ptr, size_t length, const void* host_ptr) {
   if (!file_) {
     return;
   }

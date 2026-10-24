@@ -400,6 +400,20 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
+#if REX_PLATFORM_LINUX
+    // Linux exception dispatch runs inside the SIGSEGV handler. QueryProtect
+    // opens and parses /proc/self/maps with std::ifstream, which is not
+    // async-signal-safe and may deadlock or corrupt allocator state if the
+    // signal interrupted a non-reentrant library operation. Go directly to
+    // the callback while holding the same global lock. If another thread
+    // already cleared the watch, TriggerCallbacks sees no watched page and the
+    // Memory callback handles the resulting stale-protection race.
+    if (access_violation_callback_) {
+      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                        fault_host_address, is_write);
+    }
+    return false;
+#else
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);
@@ -415,6 +429,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
                                         fault_host_address, is_write);
     }
     return false;
+#endif
   }
 
   auto rip = ex->pc();

@@ -1,5 +1,7 @@
 #include "ac6_backend_hooks.h"
 
+#include "../ac6_native_renderer2/native_renderer.h"
+
 #include <mutex>
 #include <unordered_map>
 
@@ -16,6 +18,71 @@ REXCVAR_DEFINE_BOOL(ac6_backend_signature_diagnostics, false, "AC6/Backend",
                     "Track per-frame render signatures for diagnostics overlays and backend-fix research");
 
 namespace ac6::backend {
+
+void NativeRendererOnGpuDraw(
+    rex::graphics::CommandProcessor* command_processor,
+    rex::graphics::RegisterFile* register_file,
+    rex::memory::Memory* memory,
+    uint32_t primitive_type,
+    uint32_t index_count) {
+  ac6::nr2::OnGpuDrawExact(command_processor, register_file, memory,
+                           primitive_type, index_count);
+}
+
+bool NativeRendererOnGpuCopy(
+    rex::graphics::CommandProcessor* command_processor,
+    rex::graphics::RegisterFile* register_file,
+    rex::memory::Memory* memory,
+    uint32_t* written_address,
+    uint32_t* written_length) {
+  if (ac6::nr2::SharedAuthorityEnabled()) {
+    // Shared native draws already land in the emulator-owned EDRAM target, so
+    // the immediately preceding emulator copy is authoritative. Running the
+    // private resolve path here would recreate the duplicate device/target
+    // work this mode is designed to remove.
+    if (written_address) {
+      *written_address = 0;
+    }
+    if (written_length) {
+      *written_length = 0;
+    }
+    return false;
+  }
+  return ac6::nr2::OnGpuCopyExact(command_processor, register_file, memory,
+                                  written_address, written_length);
+}
+
+void NativeRendererOnGpuSwap() {
+  ac6::nr2::OnGpuSwapExact();
+}
+
+bool NativeRendererSharedAuthorityEnabled() {
+  return ac6::nr2::SharedAuthorityEnabled();
+}
+
+bool NativeRendererPrepareVulkanDraw(const NativeVulkanDrawRequest& request,
+                                     NativeVulkanDrawPlan& plan) {
+  plan = {};
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (!ac6::nr2::PrepareAuthoritativeVulkanDraw(
+          request.command_processor, request.device, request.pipeline_layout,
+          request.pipeline_description_hash, request.pipeline_description,
+          sizeof(request.pipeline_description),
+          request.vertex_shader, request.pixel_shader,
+          request.generated_geometry_shader, request.host_vertex_shader_type,
+          request.dynamic_rendering, request.host_render_targets,
+          request.memexport_writes_possible, &pipeline)) {
+    return false;
+  }
+  plan.device = request.device;
+  plan.pipeline_layout = request.pipeline_layout;
+  plan.pipeline = pipeline;
+  return pipeline != VK_NULL_HANDLE;
+}
+
+void NativeRendererOnVulkanShutdown(VkDevice device) {
+  ac6::nr2::ShutdownAuthoritativeVulkanDevice(device);
+}
 namespace {
 
 std::mutex g_snapshot_mutex;

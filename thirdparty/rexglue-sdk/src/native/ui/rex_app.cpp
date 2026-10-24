@@ -342,6 +342,19 @@ bool ReXApp::ResolveGameSource(const std::filesystem::path& exe_dir,
 bool ReXApp::OnInitialize() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
+  auto config_path = exe_dir / (std::string(GetName()) + ".toml");
+
+  // Load config and apply presets before resolving paths. In particular,
+  // user_data_root and update_data_root must select the configured storage
+  // on every launch, including launches without command-line overrides.
+  if (std::filesystem::exists(config_path)) {
+    rex::cvar::LoadConfig(config_path);
+  }
+
+  // App-level config presets / session defaults: cvars hold their final
+  // user-config values and nothing has consumed them yet.
+  OnConfigLoaded();
+
   // Game directory: positional arg or default to exe_dir/assets
   std::filesystem::path game_dir;
   if (auto arg = GetArgument("game_directory")) {
@@ -372,17 +385,6 @@ bool ReXApp::OnInitialize() {
   game_data_root_ = std::move(path_config.game_data_root);
   user_data_root_ = std::move(path_config.user_data_root);
   update_data_root_ = std::move(path_config.update_data_root);
-
-  auto config_path = exe_dir / (std::string(GetName()) + ".toml");
-
-  // Load saved config (CVARs) before anything reads them
-  if (std::filesystem::exists(config_path)) {
-    rex::cvar::LoadConfig(config_path);
-  }
-
-  // App-level config presets / session defaults: cvars hold their final
-  // user-config values and nothing has consumed them yet.
-  OnConfigLoaded();
 
   // Logging setup from CVARs
   std::string log_file_cvar = REXCVAR_GET(log_file);
@@ -584,16 +586,18 @@ bool ReXApp::OnInitialize() {
         runtime_->set_display_window(window_.get());
         runtime_->set_imgui_drawer(imgui_drawer_.get());
 
-        // Pause the MnK virtual pad while a visible dialog owns the mouse.
-        // Uses the drawer's published per-frame flag: visibility-conjoined
+        // Pause the MnK virtual pad while a visible dialog owns the keyboard or mouse.
+        // Uses the drawer's published per-frame flags: visibility-conjoined
         // (a closed dialog can never latch it) and safe to read from the
         // input threads, unlike ImGui IO. Real controller drivers never
         // receive this callback (see InputSystem::SetActiveCallback) - a
         // physical pad keeps working with a dialog open.
         auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
         if (input_sys) {
-          input_sys->SetActiveCallback(
-              []() { return !rex::ui::ImGuiDrawer::DialogsCaptureMouse(); });
+          input_sys->SetActiveCallback([]() {
+            return !(rex::ui::ImGuiDrawer::DialogsCaptureMouse() ||
+                     rex::ui::ImGuiDrawer::DialogsCaptureKeyboard());
+          });
         }
       }
     }

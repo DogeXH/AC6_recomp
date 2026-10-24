@@ -204,6 +204,28 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
   }
 }
 
+// NT event operations report the state the event had before the operation, and the guest
+// sees it (KeSetEvent/NtSetEvent/KePulseEvent/KeResetEvent return it; XEvent passes it on, as
+// the POSIX backend computes it). kernel32's SetEvent/ResetEvent/PulseEvent drop it; ntdll's
+// NtSetEvent/NtResetEvent/NtPulseEvent return it with the same wake semantics.
+using NtEventStateFn = LONG(NTAPI*)(HANDLE, PLONG);
+struct NtEventStateFns {
+  NtEventStateFn set = nullptr;
+  NtEventStateFn reset = nullptr;
+  NtEventStateFn pulse = nullptr;
+  NtEventStateFns() {
+    if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+      set = reinterpret_cast<NtEventStateFn>(GetProcAddress(ntdll, "NtSetEvent"));
+      reset = reinterpret_cast<NtEventStateFn>(GetProcAddress(ntdll, "NtResetEvent"));
+      pulse = reinterpret_cast<NtEventStateFn>(GetProcAddress(ntdll, "NtPulseEvent"));
+    }
+  }
+};
+const NtEventStateFns& GetNtEventStateFns() {
+  static const NtEventStateFns fns;
+  return fns;
+}
+
 class Win32Event : public Win32Handle<Event> {
  public:
   explicit Win32Event(HANDLE handle) : Win32Handle(handle) {}
@@ -211,6 +233,28 @@ class Win32Event : public Win32Handle<Event> {
   void Set() override { SetEvent(handle_); }
   void Reset() override { ResetEvent(handle_); }
   void Pulse() override { PulseEvent(handle_); }
+  bool SetQueryPrevious() override {
+    return CallWithPreviousState(GetNtEventStateFns().set, [this] { SetEvent(handle_); });
+  }
+  bool ResetQueryPrevious() override {
+    return CallWithPreviousState(GetNtEventStateFns().reset, [this] { ResetEvent(handle_); });
+  }
+  bool PulseQueryPrevious() override {
+    return CallWithPreviousState(GetNtEventStateFns().pulse, [this] { PulseEvent(handle_); });
+  }
+
+ private:
+  template <typename Fallback>
+  bool CallWithPreviousState(NtEventStateFn fn, Fallback&& fallback) {
+    if (fn) {
+      LONG previous_state = 0;
+      if (fn(handle_, &previous_state) >= 0) {  // NT_SUCCESS
+        return previous_state != 0;
+      }
+    }
+    fallback();
+    return false;
+  }
 };
 
 std::unique_ptr<Event> Event::CreateManualResetEvent(bool initial_state) {

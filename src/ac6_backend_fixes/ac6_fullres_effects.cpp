@@ -20,12 +20,6 @@
 // registry, so the game stays self-consistent downstream. The emulator sees
 // an ordinary full-res surface - no RT-cache changes needed.
 
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -285,18 +279,6 @@ namespace {
 // data base is the silhouette mask - the compositor's fetch at that base is
 // cropped to 640x360.
 std::atomic<uint32_t> g_downscaler_resolve_pending{0};
-std::atomic<uint32_t> g_mask_base{0};
-
-bool SafeCopyU32Array(const uint32_t* host, uint32_t* out, uint32_t count) noexcept {
-    __try {
-        for (uint32_t i = 0; i < count; ++i) {
-            out[i] = host[i];
-        }
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
 }  // namespace
 
 bool FxFixDownscalerDraw(uint64_t ps_ucode_hash, uint32_t* surface_info,
@@ -332,41 +314,14 @@ bool FxFixDownscalerDraw(uint64_t ps_ucode_hash, uint32_t* surface_info,
     return true;
 }
 
-// Called from the guest D3D Resolve hook with the dest-texture object pointer
-// (D3DDevice_Resolve r6). If the downscaler just ran, this resolve writes the
-// silhouette mask - record its guest data base for the compositor crop. The
-// dest object embeds a GPU fetch constant; its base is dword_1 (offset 32)
-// bits 12-31 (like the texture-header dumps).
-void FxNoteResolveDest(uint32_t dest_obj, uint8_t* base) {
+// Called from the guest D3D Resolve hook after the downscaler. Mask discovery
+// is now performed directly from compositor fetch constants below, so this
+// compatibility hook only consumes the pending marker.
+void FxNoteResolveDest(uint32_t, uint8_t*) {
     if (!FullresEffectsOn()) {
         return;
     }
-    if (g_downscaler_resolve_pending.exchange(0, std::memory_order_relaxed) == 0) {
-        return;
-    }
-    if (!dest_obj || dest_obj < 0x1000 || dest_obj >= 0xE0000000u) {
-        g_downscaler_resolve_pending.store(1, std::memory_order_relaxed);  // keep looking
-        return;
-    }
-    uint32_t* host = reinterpret_cast<uint32_t*>(base + dest_obj);
-    uint32_t words[10];
-    if (!SafeCopyU32Array(host, words, 10)) {
-        g_downscaler_resolve_pending.store(1, std::memory_order_relaxed);
-        return;
-    }
-    // words are big-endian; fetch dword_1 (base+fmt) at [8], dword_2 (dims) at [9].
-    const uint32_t d1 = _byteswap_ulong(words[8]);
-    const uint32_t d2 = _byteswap_ulong(words[9]);
-    const uint32_t view_base = (d1 >> 12) << 12;
-    const uint32_t phys_base = view_base & 0x1FFFFFFFu;  // strip the 0xA0/0xC0 view
-    const uint32_t w = (d2 & 0x1FFF) + 1;
-    // The mask is the full-res (~1280 wide) resolve dest; skip small bloom
-    // resolves. Keep the flag armed until we find it (or a frame passes).
-    if (w >= 1000) {
-        g_mask_base.store(phys_base, std::memory_order_relaxed);
-    } else {
-        g_downscaler_resolve_pending.store(1, std::memory_order_relaxed);  // keep looking
-    }
+    g_downscaler_resolve_pending.store(0, std::memory_order_relaxed);
 }
 
 void FxCropCompositorMask(uint64_t vs_hash, uint64_t ps_hash, uint32_t* fetch_constants) {

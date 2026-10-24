@@ -13,6 +13,7 @@ inline constexpr uint32_t kMaxStreams = 16;
 inline constexpr uint32_t kMaxSamplers = 16;
 inline constexpr uint32_t kMaxFetchConstants = 32;
 inline constexpr uint32_t kMaxClearRectsPerRecord = 8;
+inline constexpr uint32_t kMaxVertexShaderSlots = 4;
 
 struct DrawStats {
     std::atomic<uint32_t> draw_calls{0};
@@ -30,6 +31,10 @@ struct DrawStats {
     std::atomic<uint32_t> set_viewport_calls{0};
     std::atomic<uint32_t> set_sampler_state_calls{0};
     std::atomic<uint32_t> set_texture_fetch_calls{0};
+    std::atomic<uint32_t> set_vertex_shader_calls{0};
+    std::atomic<uint32_t> set_pixel_shader_calls{0};
+    std::atomic<uint32_t> set_render_state_calls{0};
+    std::atomic<uint32_t> set_scissor_calls{0};
     std::atomic<uint32_t> clear_calls{0};
     std::atomic<uint32_t> resolve_calls{0};
 
@@ -49,6 +54,10 @@ struct DrawStats {
         set_viewport_calls.store(0, std::memory_order_relaxed);
         set_sampler_state_calls.store(0, std::memory_order_relaxed);
         set_texture_fetch_calls.store(0, std::memory_order_relaxed);
+        set_vertex_shader_calls.store(0, std::memory_order_relaxed);
+        set_pixel_shader_calls.store(0, std::memory_order_relaxed);
+        set_render_state_calls.store(0, std::memory_order_relaxed);
+        set_scissor_calls.store(0, std::memory_order_relaxed);
         clear_calls.store(0, std::memory_order_relaxed);
         resolve_calls.store(0, std::memory_order_relaxed);
     }
@@ -70,6 +79,10 @@ struct DrawStatsSnapshot {
     uint32_t set_viewport_calls;
     uint32_t set_sampler_state_calls;
     uint32_t set_texture_fetch_calls;
+    uint32_t set_vertex_shader_calls;
+    uint32_t set_pixel_shader_calls;
+    uint32_t set_render_state_calls;
+    uint32_t set_scissor_calls;
     uint32_t clear_calls;
     uint32_t resolve_calls;
 };
@@ -84,6 +97,35 @@ struct StreamBinding {
     uint32_t buffer{0};       // Guest address of D3DVertexBuffer
     uint32_t offset{0};       // Offset in bytes
     uint32_t stride{0};       // Vertex stride in bytes
+};
+
+// Shadow of the individual guest SetRenderState_* entry points (M0 native
+// renderer capture). Raw D3D-side values as passed in r4; Xenos register
+// packing happens guest-side.
+struct RenderStateBlock {
+    uint32_t alpha_blend_enable{0};    // 0x821DAC78
+    uint32_t separate_alpha_blend{0};  // 0x821DB008
+    uint32_t src_blend{0};             // 0x821DAD98
+    uint32_t dest_blend{0};            // 0x821DAE28
+    uint32_t blend_op{0};              // 0x821DAD08
+    uint32_t src_blend_alpha{0};       // 0x821DAF28
+    uint32_t dest_blend_alpha{0};      // 0x821DAF98
+    uint32_t blend_op_alpha{0};        // 0x821DAEB8
+    uint32_t z_enable{0};              // 0x821DB330
+    uint32_t z_write_enable{0};        // 0x821DB370
+    uint32_t z_func{0};                // 0x821DB3A0
+    uint32_t stencil_enable{0};        // 0x821DB3D8
+    uint32_t cull_mode{0};             // 0x821DABE0
+    uint32_t fill_mode{0};             // 0x821DAC10
+    uint32_t alpha_test_enable{0};     // 0x821DC458
+    uint32_t alpha_func{0};            // 0x821DC3F0 (naming tentative)
+    uint32_t alpha_ref{0};             // 0x821DC4E8 (naming tentative)
+    struct {
+        uint32_t left{0};
+        uint32_t top{0};
+        uint32_t right{0};
+        uint32_t bottom{0};
+    } scissor;                         // 0x821DCF28
 };
 
 struct SamplerBinding {
@@ -106,6 +148,12 @@ struct ShadowState {
     std::array<SamplerBinding, kMaxSamplers> samplers{};
     std::array<uint32_t, kMaxFetchConstants> texture_fetch_ptrs{};
     uint32_t shader_gpr_alloc{0};
+    // Guest addresses of the bound shader objects (device+12432..12448).
+    // Slot 0 is the primary vertex shader; slots 1-3 are the driver's
+    // auxiliary vertex shader slots (multi-pass paths).
+    std::array<uint32_t, kMaxVertexShaderSlots> vertex_shaders{};
+    uint32_t pixel_shader{0};
+    RenderStateBlock render_states{};
     uint64_t vertex_fetch_layout_signature{0};
     uint64_t texture_fetch_layout_signature{0};
     uint64_t resource_binding_signature{0};

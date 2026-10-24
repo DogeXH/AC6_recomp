@@ -97,6 +97,13 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
+  // Hold-to-quit for the guide (Steam) button. Runs on SDL host threads
+  // (event callback + timer) so it works even when the guest is wedged.
+  void OnGuideButtonChanged(bool pressed);
+  static Uint32 GuideHoldTimerCallback(void* userdata, SDL_TimerID timer_id, Uint32 interval);
+  static Uint32 GuideHoldHardExitCallback(void* userdata, SDL_TimerID timer_id, Uint32 interval);
+  std::atomic<Uint32> guide_hold_timer_id_{0};
+  SDL_TimerID pump_heartbeat_timer_id_ = 0;
 };
 
 }  // namespace rex::input::sdl

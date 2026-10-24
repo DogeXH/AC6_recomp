@@ -55,8 +55,12 @@ class SdlAudioDriver : public AudioDriver {
   std::atomic<uint32_t> consumed_frames_{0};
   std::atomic<uint32_t> underrun_count_{0};
   std::atomic<uint32_t> silence_injections_{0};
+  uint64_t last_underrun_log_ms_ = 0;
   std::atomic<uint32_t> queued_depth_{0};
   std::atomic<uint32_t> peak_queued_depth_{0};
+  std::atomic<uint32_t> explicit_silence_submissions_{0};
+  std::atomic<uint32_t> zero_output_frames_{0};
+  std::atomic<uint32_t> nonzero_output_frames_{0};
 };
 
 }  // namespace rex::audio::sdl

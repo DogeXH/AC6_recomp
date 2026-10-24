@@ -162,6 +162,9 @@ static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
 
 class XmaContext {
  public:
+  // Guest-facing setters do load-mutate-store on the 64-byte guest context
+  // and must exclude the decode pass (Load / decode / StoreContextMerged).
+  std::mutex& guest_lock() { return lock_; }
   static const uint32_t kBytesPerPacket = 2048;
   static const uint32_t kBitsPerPacket = kBytesPerPacket * 8;
   static const uint32_t kBitsPerPacketHeader = 32;

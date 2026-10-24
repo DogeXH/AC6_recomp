@@ -23,6 +23,9 @@
 #include <rex/ui/virtual_key.h>
 #include <native/ui/windowed_app_context_win.h>
 
+REXCVAR_DECLARE(int32_t, window_x);
+REXCVAR_DECLARE(int32_t, window_y);
+
 #include <ShellScalingApi.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -189,9 +192,16 @@ bool Win32Window::OpenImpl() {
   // the assignment here to handle the case of a failure after WM_NCCREATE, for
   // instance.
   auto wide_title = rex::string::to_utf16(GetTitle());
+  // Optional explicit placement (screen coordinates; Mac fork c3330607f), -1 = system default.
+  int window_pos_x = CW_USEDEFAULT;
+  int window_pos_y = CW_USEDEFAULT;
+  if (REXCVAR_GET(window_x) >= 0 && REXCVAR_GET(window_y) >= 0) {
+    window_pos_x = REXCVAR_GET(window_x);
+    window_pos_y = REXCVAR_GET(window_y);
+  }
   hwnd_ = CreateWindowExW(
       window_ex_style, L"RexWindowClass", reinterpret_cast<LPCWSTR>(wide_title.c_str()),
-      window_style, CW_USEDEFAULT, CW_USEDEFAULT, window_size_rect.right - window_size_rect.left,
+      window_style, window_pos_x, window_pos_y, window_size_rect.right - window_size_rect.left,
       window_size_rect.bottom - window_size_rect.top, nullptr, nullptr, hinstance, this);
   if (!hwnd_) {
     REXLOG_ERROR("CreateWindowExW failed");

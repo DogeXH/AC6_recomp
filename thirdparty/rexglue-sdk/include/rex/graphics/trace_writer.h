@@ -36,12 +36,42 @@ class TraceWriter {
   void WritePrimaryBufferEnd();
   void WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count);
   void WriteIndirectBufferEnd();
-  void WritePacketStart(uint32_t base_ptr, uint32_t count);
-  void WritePacketEnd();
-  void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
-  void WriteMemoryReadCached(uint32_t base_ptr, size_t length);
-  void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length);
-  void WriteMemoryWrite(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
+  void WritePacketStart(uint32_t base_ptr, uint32_t count) {
+    if (file_) {
+      WritePacketStartImpl(base_ptr, count);
+    }
+  }
+  void WritePacketStartImpl(uint32_t base_ptr, uint32_t count);
+  void WritePacketEnd() {
+    if (file_) {
+      WritePacketEndImpl();
+    }
+  }
+  void WritePacketEndImpl();
+  void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr) {
+    if (file_) {
+      WriteMemoryReadImpl(base_ptr, length, host_ptr);
+    }
+  }
+  void WriteMemoryReadImpl(uint32_t base_ptr, size_t length, const void* host_ptr);
+  void WriteMemoryReadCached(uint32_t base_ptr, size_t length) {
+    if (file_) {
+      WriteMemoryReadCachedImpl(base_ptr, length);
+    }
+  }
+  void WriteMemoryReadCachedImpl(uint32_t base_ptr, size_t length);
+  void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length) {
+    if (file_) {
+      WriteMemoryReadCachedNopImpl(base_ptr, length);
+    }
+  }
+  void WriteMemoryReadCachedNopImpl(uint32_t base_ptr, size_t length);
+  void WriteMemoryWrite(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr) {
+    if (file_) {
+      WriteMemoryWriteImpl(base_ptr, length, host_ptr);
+    }
+  }
+  void WriteMemoryWriteImpl(uint32_t base_ptr, size_t length, const void* host_ptr);
   void WriteEdramSnapshot(const void* snapshot);
   void WriteEvent(EventCommand::Type event_type);
   void WriteRegisters(uint32_t first_register, const uint32_t* register_values,

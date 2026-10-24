@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -102,6 +103,22 @@ namespace {
 constexpr uint32_t kAc6MovieWorkerSetEvent = 0x82916E3C;
 constexpr uint32_t kAc6MovieWorkerWaitEvent0 = 0x82916E2C;
 constexpr uint32_t kAc6MovieWorkerWaitEvent1 = 0x82916E08;
+constexpr uint64_t kAc6AudioSubmitSyncTraceInterval = 256;
+
+std::atomic<uint64_t> g_ac6_audio_submit_ack_set_count{0};
+std::atomic<uint64_t> g_ac6_audio_submit_wait_enter_count{0};
+std::atomic<uint64_t> g_ac6_audio_submit_wait_exit_count{0};
+std::atomic<uint64_t> g_ac6_audio_submit_wait_result0_count{0};
+std::atomic<uint64_t> g_ac6_audio_submit_wait_result1_count{0};
+std::atomic<uint64_t> g_ac6_audio_submit_wait_other_result_count{0};
+
+bool IsAc6AudioSubmitSyncTraceEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AC6_AUDIO_SYNC_TRACE");
+    return value && value[0] && value[0] != '0';
+  }();
+  return enabled;
+}
 
 bool IsAc6MovieWorkerWait(uint32_t count, ppc_pu32_t objects_ptr) {
   if (count != 2 || !objects_ptr) {
@@ -555,7 +572,8 @@ void KeInitializeEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, ppc_u32_t event_type
 }
 
 uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
-  if (uint32_t(reinterpret_cast<uintptr_t>(event_ptr)) == kAc6MovieWorkerSetEvent) {
+  const uint32_t event_address = uint32_t(reinterpret_cast<uintptr_t>(event_ptr));
+  if (event_address == kAc6MovieWorkerSetEvent) {
     REXKRNL_DEBUG("[KeSetEvent] AC6 movie worker event ptr={:08X} increment={} wait={}",
                   uint32_t(reinterpret_cast<uintptr_t>(event_ptr)), increment, wait);
   }
@@ -566,7 +584,11 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
     return 0;
   }
 
-  return ev->Set(increment, !!wait);
+  const uint32_t result = ev->Set(increment, !!wait);
+  if (event_address == kAc6MovieWorkerSetEvent && IsAc6AudioSubmitSyncTraceEnabled()) {
+    g_ac6_audio_submit_ack_set_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  return result;
 }
 
 ppc_u32_result_t KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, ppc_u32_t increment,
@@ -995,10 +1017,38 @@ ppc_u32_result_t KeWaitForMultipleObjects_entry(ppc_u32_t count, ppc_pu32_t obje
     objects.push_back(std::move(object_ref));
   }
 
+  bool trace_ac6_audio_submit_wait = false;
+  if (is_ac6_movie_worker_wait && IsAc6AudioSubmitSyncTraceEnabled()) {
+    g_ac6_audio_submit_wait_enter_count.fetch_add(1, std::memory_order_relaxed);
+    trace_ac6_audio_submit_wait = true;
+  }
+
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  if (trace_ac6_audio_submit_wait) {
+    const uint64_t wait_exit_count =
+        g_ac6_audio_submit_wait_exit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint32_t wait_result = static_cast<uint32_t>(result);
+    if (wait_result == 0) {
+      g_ac6_audio_submit_wait_result0_count.fetch_add(1, std::memory_order_relaxed);
+    } else if (wait_result == 1) {
+      g_ac6_audio_submit_wait_result1_count.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      g_ac6_audio_submit_wait_other_result_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!(wait_exit_count % kAc6AudioSubmitSyncTraceInterval)) {
+      REXKRNL_ERROR(
+          "[AC6_AUDIO_SUBMIT_SYNC] waits_entered={} waits_exited={} ack_sets={} "
+          "result0_event_82916E2C={} result1_event_82916E08={} other={} last_result={}",
+          g_ac6_audio_submit_wait_enter_count.load(std::memory_order_relaxed), wait_exit_count,
+          g_ac6_audio_submit_ack_set_count.load(std::memory_order_relaxed),
+          g_ac6_audio_submit_wait_result0_count.load(std::memory_order_relaxed),
+          g_ac6_audio_submit_wait_result1_count.load(std::memory_order_relaxed),
+          g_ac6_audio_submit_wait_other_result_count.load(std::memory_order_relaxed), wait_result);
+    }
+  }
   if (is_ac6_movie_worker_wait) {
     const uint32_t object0 = static_cast<uint32_t>(objects_ptr[0]);
     const uint32_t object1 = static_cast<uint32_t>(objects_ptr[1]);

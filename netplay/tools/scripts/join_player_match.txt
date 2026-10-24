@@ -1,0 +1,42 @@
+# PLACEHOLDER - instance B (Avril) finds A's Player Match through matchmaking and joins.
+# The menu path below is a GUESS: AC6's online menu navigation has not been explored yet.
+# Replace the marked block once the main session has mapped the menus.
+# Format: netplay/docs/TESTING.md, "Input scripts".
+
+log join: waiting for sign-in to Live
+wait_trace "ev":"xam.live" 120000
+screenshot_every 2000 shots/join_frames
+
+wait 15000
+press START
+wait 3000
+screenshot shots/join_main_menu.ppm
+
+# Wait until the host's session exists: host_player_match.txt touches this flag after its
+# xgi.create (launch_pair.sh clears old flags). See TESTING.md "Coordinating two instances".
+wait_file ../host_session_ready.flag 300000
+
+# ---- PLACEHOLDER: main menu -> Xbox LIVE -> Player Match -> Quick Match / Custom Match ---
+press DOWN
+press DOWN
+press A
+wait 3000
+screenshot shots/join_online_menu.ppm
+press A
+# ---- end of placeholder block ----------------------------------------------------------
+
+# Matchmaking: the search should return A's session.
+wait_trace "ev":"xgi.search" 60000
+screenshot shots/join_search_results.ppm
+
+# ---- PLACEHOLDER: pick the first result and confirm ------------------------------------
+press A
+wait 2000
+press A
+# ---- end of placeholder block ----------------------------------------------------------
+
+wait_trace "ev":"xgi.join" 60000
+log join: joined the session
+wait 5000
+screenshot shots/join_lobby.ppm
+screenshot_stop

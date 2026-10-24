@@ -351,6 +351,19 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + header_size, viewports, sizeof(VkViewport) * viewport_count);
   }
 
+  // Diagnostic command used by the trace harness. Keeping the timestamp in
+  // the deferred stream preserves its exact position relative to guest draws,
+  // resolves, barriers and render-pass transitions when the stream is later
+  // materialized into the real Vulkan command buffer.
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage,
+                           VkQueryPool query_pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(WriteCommand(
+        Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
+  }
+
  private:
   enum class Command {
     kVkBeginRenderPass,
@@ -381,6 +394,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kVkWriteTimestamp,
   };
 
   struct CommandHeader {
@@ -575,6 +589,12 @@ class DeferredCommandBuffer {
     uint32_t viewport_count;
     // Followed by aligned VkViewport[].
     static_assert(alignof(VkViewport) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkQueryPool query_pool;
+    uint32_t query;
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);

@@ -117,10 +117,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
         merged.gamepad.thumb_rx = merge_axis(merged.gamepad.thumb_rx, state.gamepad.thumb_rx);
         merged.gamepad.thumb_ry = merge_axis(merged.gamepad.thumb_ry, state.gamepad.thumb_ry);
 
-        if (static_cast<uint32_t>(state.packet_number) >
-            static_cast<uint32_t>(merged.packet_number)) {
-          merged.packet_number = state.packet_number;
-        }
+        // XInput titles treat an unchanged dwPacketNumber as "no new input". Taking the
+        // maximum hides changes on any device whose counter is behind another device's, so a
+        // merged pad could silently drop presses. Each device's counter is monotonic, so their
+        // sum is too, and it changes whenever any merged device changes (Mac fork c3330607f).
+        merged.packet_number = static_cast<uint32_t>(merged.packet_number) +
+                               static_cast<uint32_t>(state.packet_number);
       }
     }
   }
@@ -161,7 +163,7 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
+    if (result == X_ERROR_SUCCESS) {
       return result;
     }
   }

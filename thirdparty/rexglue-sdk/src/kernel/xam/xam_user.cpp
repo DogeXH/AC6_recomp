@@ -22,6 +22,14 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#if REX_HAVE_AC6NET
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "netplay_glue.h"
+#endif
+
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
 namespace rex {
@@ -43,6 +51,18 @@ ppc_hresult_result_t XamUserGetXUID_entry(ppc_u32_t user_index, ppc_u32_t type_m
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
+#if REX_HAVE_AC6NET
+      // Netplay: the ONLINE bit (2; 1 = OFFLINE, 4 = GUEST as in Xenia) returns the
+      // server-assigned online XUID while signed in to Live; saves stay keyed by the offline
+      // XUID. AC6 calls this only through XUserGetXUID (rex_sub_821F4618), with type_mask 7.
+      if (netplay::Enabled()) {
+        const uint64_t online_xuid = netplay::OnlineXuid();
+        if ((type_mask & 2) && netplay::SignedInToLive() && online_xuid) {
+          *xuid_ptr = online_xuid;
+          return X_E_SUCCESS;
+        }
+      }
+#endif
       if (type & (2 | 4)) {
         // maybe online profile?
         xuid = user_profile->xuid();
@@ -66,6 +86,11 @@ ppc_u32_result_t XamUserGetSigninState_entry(ppc_u32_t user_index) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       signin_state = user_profile->signin_state();
+#if REX_HAVE_AC6NET
+      if (netplay::SignedInToLive()) {
+        signin_state = 2;  // signed in to Live
+      }
+#endif
     }
   }
   return signin_state;
@@ -93,6 +118,34 @@ ppc_hresult_result_t XamUserGetSigninInfo_entry(ppc_u32_t user_index, ppc_u32_t 
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+#if REX_HAVE_AC6NET
+  if (netplay::Enabled()) {
+    // Flag values follow the XDK and Xenia (xam.h:151-154): 1 = ONLINE_XUID_ONLY,
+    // 2 = OFFLINE_XUID_ONLY. Every AC6 call (via rex_sub_821F5190) passes 0, the logon XUID.
+    constexpr uint32_t kOnlineXuidOnly = 1;
+    constexpr uint32_t kOfflineXuidOnly = 2;
+    constexpr uint32_t kInfoFlagLiveEnabled = 1;
+    const bool live = netplay::SignedInToLive();
+    const uint64_t online_xuid = netplay::OnlineXuid();
+    uint64_t xuid = user_profile->xuid();
+    if (!flags && live && online_xuid) {
+      xuid = online_xuid;
+    }
+    if (flags & kOfflineXuidOnly) {
+      xuid = user_profile->xuid();
+    }
+    if ((flags & kOnlineXuidOnly) && online_xuid) {
+      xuid = online_xuid;
+    }
+    info->xuid = xuid;
+    info->unk08 = kInfoFlagLiveEnabled;
+    info->signin_state = live ? 2u : user_profile->signin_state();
+    const std::string gamertag = netplay::Gamertag();
+    rex::string::util_copy_truncating(info->name, gamertag.empty() ? user_profile->name() : gamertag,
+                                 rex::countof(info->name));
+    return X_E_SUCCESS;
+  }
+#endif
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
@@ -110,7 +163,12 @@ ppc_u32_result_t XamUserGetName_entry(ppc_u32_t user_index, ppc_pchar_t buffer,
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  const auto& user_name = user_profile->name();
+  std::string user_name = user_profile->name();
+#if REX_HAVE_AC6NET
+  if (const std::string gamertag = netplay::Gamertag(); !gamertag.empty()) {
+    user_name = gamertag;
+  }
+#endif
   rex::string::util_copy_truncating(buffer, user_name, std::min(buffer_len.value(), uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -130,7 +188,13 @@ ppc_u32_result_t XamUserGetGamerTag_entry(ppc_u32_t user_index, ppc_pchar16_t bu
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  auto user_name = rex::string::to_utf16(user_profile->name());
+  std::string name = user_profile->name();
+#if REX_HAVE_AC6NET
+  if (const std::string gamertag = netplay::Gamertag(); !gamertag.empty()) {
+    name = gamertag;
+  }
+#endif
+  auto user_name = rex::string::to_utf16(name);
   rex::string::util_copy_and_swap_truncating(buffer, user_name,
                                              std::min(buffer_len.value(), uint32_t(16)));
   return X_E_SUCCESS;
@@ -386,6 +450,14 @@ ppc_u32_result_t XamUserCheckPrivilege_entry(ppc_u32_t user_index, ppc_u32_t mas
     }
   }
 
+#if REX_HAVE_AC6NET
+  // Netplay: grant every privilege while signed in to Live (AC6 checks 0xFE multiplayer,
+  // 0xF8/0xF9 profile viewing and 0xFB/0xFC communications), as Xenia Netplay does.
+  if (netplay::SignedInToLive()) {
+    *out_value = 1;
+    return X_ERROR_SUCCESS;
+  }
+#endif
   // If we deny everything, games should hopefully not try to do stuff.
   *out_value = 0;
   return X_ERROR_SUCCESS;
@@ -695,17 +767,188 @@ ppc_u32_result_t XamWriteGamerTile_entry(ppc_u32_t arg1, ppc_u32_t arg2, ppc_u32
 }
 
 ppc_u32_result_t XamSessionCreateHandle_entry(ppc_pu32_t handle_ptr) {
+#if REX_HAVE_AC6NET
+  if (netplay::Enabled()) {
+    // A real kernel object with a guest X_KSESSION (Xenia Netplay xam_user.cc:1441-1452).
+    if (!handle_ptr) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    auto session = object_ref<netplay::XSession>(new netplay::XSession(REX_KERNEL_STATE()));
+    const X_STATUS status = session->Initialize();
+    if (XFAILED(status)) {
+      return status;
+    }
+    *handle_ptr = session->handle();
+    return X_ERROR_SUCCESS;
+  }
+#endif
   *handle_ptr = 0xCAFEDEAD;
   return X_ERROR_SUCCESS;
 }
 
 ppc_u32_result_t XamSessionRefObjByHandle_entry(ppc_u32_t handle, ppc_pu32_t obj_ptr) {
+#if REX_HAVE_AC6NET
+  if (netplay::Enabled()) {
+    // Xenia Netplay xam_user.cc:1455-1466: the caller takes a handle reference, released by the
+    // ObDereferenceObject every AC6 session wrapper issues after its XMsg call.
+    if (!obj_ptr) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    auto session = REX_KERNEL_OBJECTS()->LookupObject<netplay::XSession>(handle);
+    if (!session) {
+      return X_STATUS_INVALID_HANDLE;
+    }
+    session->RetainHandle();
+    *obj_ptr = session->guest_object();
+    return X_ERROR_SUCCESS;
+  }
+#endif
   assert_true(handle == 0xCAFEDEAD);
   // TODO(PermaNull): Implement this properly,
   // For the time being returning 0xDEADF00D will prevent crashing.
   *obj_ptr = 0xDEADF00D;
   return X_ERROR_SUCCESS;
 }
+
+#if REX_HAVE_AC6NET
+// XamUserCreateStatsEnumerator, ported from Xenia Netplay xam_user.cc:1589-1727
+// (Copyright 2026 Xenia Canary, BSD-3-Clause) and backed by ac6net::xlive::StatsEnumerate.
+// Xenia copies results from a leaked system-heap block so the pointers inside stay valid; here
+// the enumerator lays the results out at XamEnumerate time, with pointers into the guest's own
+// output buffer. Layout (Xenia LeaderboardObjectJSON::WriteResults):
+//   X_USER_STATS_READ_RESULTS {num_views, views_ptr}
+//   X_USER_STATS_VIEW[num_views]  {view_id, total_view_rows, num_rows, rows_ptr}
+//   per view: X_USER_STATS_ROW[] {xuid, rank, pad, i64 rating, gamertag[16], num_columns,
+//             columns_ptr} then X_USER_STATS_COLUMN[] {u16 id, pad, XUSER_DATA} per row.
+
+constexpr uint32_t kStatsSpecSize = 8 + 64 * 2;  // X_USER_STATS_SPEC
+constexpr uint32_t kStatsMaxRows = 100;          // X_STATS_MAX_ROW_COUNT
+constexpr uint32_t kStatsMaxSpecs = 64;          // XUserMaxReadStatsSpec
+
+class XStatsEnumerator : public XEnumerator {
+ public:
+  XStatsEnumerator(KernelState* kernel_state, uint32_t buffer_size,
+                   std::vector<ac6net::xlive::StatsView> views)
+      : XEnumerator(kernel_state, 1, buffer_size), views_(std::move(views)) {}
+
+  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override {
+    if (written_) {
+      return X_ERROR_NO_MORE_FILES;
+    }
+    auto arena = netplay::MakeArena(REX_KERNEL_MEMORY(), buffer_ptr,
+                                    static_cast<uint32_t>(item_size()));
+    if (arena.size() < netplay::marshal::kStatsReadResultsSize) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    written_ = true;
+    arena.Reset();
+    if (!netplay::marshal::LayoutStatsResults(arena, views_)) {
+      REXKRNL_WARN("XamUserCreateStatsEnumerator: results truncated to {} bytes", arena.size());
+    }
+    if (written_count) {
+      *written_count = 1;
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+ private:
+  std::vector<ac6net::xlive::StatsView> views_;
+  bool written_ = false;
+};
+
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 enumerator_type, ppc_u64_t pivot, u32 num_rows,
+                                       u32 num_specs, u32 specs_ptr, u32 buffer_size_ptr,
+                                       u32 handle_ptr) {
+  if (!netplay::Enabled()) {
+    // Unchanged stub behaviour: log and leave r3 = title_id.
+    REXKRNL_WARN("{} STUB", "__imp__XamUserCreateStatsEnumerator");
+    return title_id;
+  }
+  auto* memory = REX_KERNEL_MEMORY();
+  if (!netplay::GuestRangeValid(memory, handle_ptr, 4)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  memory::store_and_swap<uint32_t>(memory->TranslateVirtual(handle_ptr), 0);
+  if (!netplay::GuestRangeValid(memory, buffer_size_ptr, 4)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  memory::store_and_swap<uint32_t>(memory->TranslateVirtual(buffer_size_ptr), 0);
+  if (!pivot || !num_rows || num_rows > kStatsMaxRows || !num_specs ||
+      num_specs > kStatsMaxSpecs || enumerator_type > 3 ||
+      !netplay::GuestRangeValid(memory, specs_ptr, num_specs * kStatsSpecSize)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  std::vector<ac6net::xlive::StatsSpec> specs(num_specs);
+  const uint8_t* spec_data = memory->TranslateVirtual(specs_ptr);
+  for (uint32_t i = 0; i < num_specs; ++i) {
+    const uint8_t* spec = spec_data + i * kStatsSpecSize;
+    specs[i].view_id = memory::load_and_swap<uint32_t>(spec + 0);
+    const uint32_t columns =
+        std::min(memory::load_and_swap<uint32_t>(spec + 4), netplay::marshal::kStatsMaxColumns);
+    for (uint32_t c = 0; c < columns; ++c) {
+      specs[i].column_ids.push_back(memory::load_and_swap<uint16_t>(spec + 8 + c * 2));
+    }
+  }
+  // Xenia's size formula, including its 4 spare bytes per column.
+  const uint32_t buffer_size = netplay::marshal::StatsEnumeratorBufferSize(num_rows, specs);
+
+  ac6net::xlive::StatsPivot stats_pivot = ac6net::xlive::StatsPivot::kXuid;
+  uint64_t pivot_value = pivot;
+  switch (enumerator_type) {
+    case 0:  // XUID
+      break;
+    case 1:  // RANK
+    case 2:  // RANK_PER_SPEC
+      stats_pivot = ac6net::xlive::StatsPivot::kRank;
+      pivot_value = pivot & 0xFFFF;  // 58410826 expects ranks to start at the pivot (Xenia)
+      break;
+    case 3:  // BY_RATING
+      stats_pivot = ac6net::xlive::StatsPivot::kRating;
+      break;
+  }
+
+  // "4E4D07D1 expects result to create session" (Xenia xam_user.cc:1709): there is always one
+  // result item, with one view per spec.
+  std::vector<ac6net::xlive::StatsView> views;
+  for (const auto& spec : specs) {
+    ac6net::xlive::StatsView view;
+    uint32_t hr = ac6net::hr::kNotLoggedOn;
+    if (netplay::SignedInToLive()) {
+      hr = netplay::Live().StatsEnumerate(spec, stats_pivot, pivot_value, num_rows, &view);
+    }
+    if (hr != ac6net::hr::kOk) {
+      REXKRNL_WARN("XamUserCreateStatsEnumerator: view {:08X} -> {:08X}; returning a local row",
+                   spec.view_id, hr);
+      view = {};
+      if (stats_pivot == ac6net::xlive::StatsPivot::kXuid) {
+        ac6net::xlive::StatsRow row;
+        row.xuid = pivot;
+        row.gamertag = netplay::Gamertag();
+        for (uint16_t column_id : spec.column_ids) {
+          ac6net::xlive::StatsColumn column;
+          column.column_id = column_id;
+          column.value.type = ac6net::DataType::kInt32;
+          row.columns.push_back(std::move(column));
+        }
+        view.rows.push_back(std::move(row));
+      }
+    }
+    view.view_id = spec.view_id;
+    views.push_back(std::move(view));
+  }
+
+  auto e = object_ref<XStatsEnumerator>(
+      new XStatsEnumerator(REX_KERNEL_STATE(), buffer_size, std::move(views)));
+  const X_STATUS result = e->Initialize(0xFE /* XUserIndexNone */, 0xFB, 0xB0023, 0xB0024, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+  memory::store_and_swap<uint32_t>(memory->TranslateVirtual(buffer_size_ptr), buffer_size);
+  memory::store_and_swap<uint32_t>(memory->TranslateVirtual(handle_ptr), e->handle());
+  return X_ERROR_SUCCESS;
+}
+#endif  // REX_HAVE_AC6NET
 
 }  // namespace xam
 }  // namespace kernel
@@ -743,7 +986,12 @@ XAM_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 XAM_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 XAM_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 XAM_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
+#if REX_HAVE_AC6NET
+XAM_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
+#else
 XAM_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
+#endif
 XAM_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 XAM_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 XAM_EXPORT_STUB(__imp__XamUserGetAge);

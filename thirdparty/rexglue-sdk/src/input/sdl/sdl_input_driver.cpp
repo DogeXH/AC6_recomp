@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 
 #include <rex/assert.h>
@@ -23,6 +24,10 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+
+REXCVAR_DEFINE_INT32(input_guide_hold_quit_ms, 2000, "Input",
+                     "Hold the guide (Steam) button this long in milliseconds to close the "
+                     "game cleanly (0 disables)");
 
 namespace rex::input::sdl {
 
@@ -52,7 +57,12 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_mutex_(),
       keystroke_states_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  if (pump_heartbeat_timer_id_ != 0) {
+    SDL_RemoveTimer(pump_heartbeat_timer_id_);
+    pump_heartbeat_timer_id_ = 0;
+  }
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -123,6 +133,18 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
           }
         }
       }
+      // Host-side input heartbeat: the guest normally drives event pumping
+      // (GetState -> QueueControllerUpdate), so a wedged guest starves SDL of
+      // events and would make the guide hold-to-quit rescue unreachable. Pump
+      // on a fixed cadence from SDL's timer thread as well.
+      pump_heartbeat_timer_id_ = SDL_AddTimer(
+          100,
+          [](void* userdata, SDL_TimerID, Uint32 interval) -> Uint32 {
+            static_cast<SDLInputDriver*>(userdata)->QueueControllerUpdate();
+            return interval;
+          },
+          this);
+
       REXLOG_INFO("SDL input driver initialized successfully");
     });
   }
@@ -397,7 +419,69 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
   return X_ERROR_EMPTY;
 }
 
+
+void SDLInputDriver::OnGuideButtonChanged(bool pressed) {
+  const int32_t hold_ms = REXCVAR_GET(input_guide_hold_quit_ms);
+  if (hold_ms <= 0) {
+    return;
+  }
+  if (pressed) {
+    Uint32 expected = 0;
+    // Only arm one timer even if SDL delivers repeated down events.
+    if (guide_hold_timer_id_.load(std::memory_order_acquire) == 0) {
+      const SDL_TimerID id =
+          SDL_AddTimer(static_cast<Uint32>(hold_ms), &SDLInputDriver::GuideHoldTimerCallback, this);
+      if (id != 0 && !guide_hold_timer_id_.compare_exchange_strong(expected, id,
+                                                                   std::memory_order_acq_rel)) {
+        SDL_RemoveTimer(id);
+      }
+    }
+  } else {
+    const Uint32 id = guide_hold_timer_id_.exchange(0, std::memory_order_acq_rel);
+    if (id != 0) {
+      SDL_RemoveTimer(id);
+    }
+  }
+}
+
+Uint32 SDLInputDriver::GuideHoldTimerCallback(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
+  (void)timer_id;
+  (void)interval;
+  auto* driver = static_cast<SDLInputDriver*>(userdata);
+  driver->guide_hold_timer_id_.store(0, std::memory_order_release);
+  rex::ui::Window* close_window =
+      driver->attached_window_ ? driver->attached_window_ : driver->window();
+  if (!close_window) {
+    REXLOG_WARN("Guide hold-to-quit triggered but no window is attached; ignoring.");
+    return 0;
+  }
+  REXLOG_INFO("Guide (Steam) button held {} ms - closing the game.",
+              REXCVAR_GET(input_guide_hold_quit_ms));
+  close_window->app_context().CallInUIThread([close_window]() { close_window->RequestClose(); });
+  // If the clean path cannot finish (e.g. TerminateTitle blocked on a wedged
+  // guest), force the process down so the user is never trapped in the game.
+  SDL_AddTimer(7000, &SDLInputDriver::GuideHoldHardExitCallback, nullptr);
+  return 0;
+}
+
+Uint32 SDLInputDriver::GuideHoldHardExitCallback(void* userdata, SDL_TimerID timer_id,
+                                                 Uint32 interval) {
+  (void)userdata;
+  (void)timer_id;
+  (void)interval;
+  REXLOG_ERROR("Clean shutdown did not complete within 7s of the guide hold; forcing exit.");
+  std::_Exit(2);
+  return 0;
+}
+
 void SDLInputDriver::HandleEvent(const SDL_Event& event) {
+  // Hold-to-quit runs entirely on host threads (SDL event + timer) so it
+  // still works when the guest wedges and stops polling input.
+  if ((event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+      event.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+    OnGuideButtonChanged(event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+  }
+
   // This callback will likely run on the thread that posts the event, which
   // may be a dedicated thread SDL has created for the joystick subsystem.
 
@@ -697,6 +781,9 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+  if (!attached_window_) {
+    return;
+  }
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);

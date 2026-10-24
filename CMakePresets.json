@@ -22,13 +22,32 @@
             }
         },
         {
+            "name": "win-amd64-cross-base",
+            "hidden": true,
+            "description": "Cross-build Windows x64 (MSVC ABI) from macOS/Linux: clang --target=x86_64-pc-windows-msvc + lld-link + xwin SDK/CRT. Static CRT (/MT; CMP0091 NEW also for old third-party projects), so players need no VC++ redistributable. Set XWIN_DIR. See netplay/docs/BUILDING_WINDOWS.md.",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "toolchainFile": "${sourceDir}/cmake/toolchains/win-amd64-xwin.cmake",
+            "cacheVariables": {
+                "XWIN_DIR": "$env{XWIN_DIR}",
+                "CMAKE_C_FLAGS": "-march=x86-64-v3 -w",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v3 -w",
+                "PYTHON_EXECUTABLE": "python3",
+                "REXSDK_DIR": "${sourceDir}/thirdparty/rexglue-sdk",
+                "REXGLUE_USE_D3D12": "ON",
+                "REXGLUE_USE_VULKAN": "ON",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded",
+                "CMAKE_POLICY_DEFAULT_CMP0091": "NEW"
+            }
+        },
+        {
             "name": "linux-base",
             "hidden": true,
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "cacheVariables": {
-                "CMAKE_C_COMPILER": "clang-20",
-                "CMAKE_CXX_COMPILER": "clang++-20",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_C_FLAGS": "-march=x86-64-v3",
                 "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
                 "REXSDK_DIR": "${sourceDir}/thirdparty/rexglue-sdk"
@@ -90,6 +109,24 @@
             }
         },
         {
+            "name": "win-amd64-cross-relwithdebinfo",
+            "displayName": "Windows AMD64 RelWithDebInfo (cross, xwin)",
+            "description": "D3D12 + Vulkan, line-table-only CodeView debug info (PDB) to keep the build small.",
+            "inherits": "win-amd64-cross-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
+                "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -DNDEBUG -gline-tables-only -gcodeview",
+                "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -DNDEBUG -gline-tables-only -gcodeview"
+            }
+        },
+        {
+            "name": "win-amd64-cross-release",
+            "displayName": "Windows AMD64 Release (cross, xwin)",
+            "inherits": "win-amd64-cross-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
             "name": "linux-amd64-relwithdebinfo",
             "displayName": "Linux AMD64 RelWithDebInfo",
             "inherits": "linux-base",
@@ -102,6 +139,8 @@
         { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" },
         { "name": "win-amd64-vulkan-relwithdebinfo", "configurePreset": "win-amd64-vulkan-relwithdebinfo" },
         { "name": "win-amd64-vulkan-only-relwithdebinfo", "configurePreset": "win-amd64-vulkan-only-relwithdebinfo" },
+        { "name": "win-amd64-cross-relwithdebinfo", "configurePreset": "win-amd64-cross-relwithdebinfo", "targets": ["ac6recomp"] },
+        { "name": "win-amd64-cross-release", "configurePreset": "win-amd64-cross-release", "targets": ["ac6recomp"] },
         { "name": "linux-amd64-debug", "configurePreset": "linux-amd64-debug" },
         { "name": "linux-amd64-release", "configurePreset": "linux-amd64-release" },
         { "name": "linux-amd64-relwithdebinfo", "configurePreset": "linux-amd64-relwithdebinfo" }

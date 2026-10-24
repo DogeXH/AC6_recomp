@@ -21,12 +21,15 @@ REXCVAR_DECLARE(std::string, ac6_densify_y_fetch_hashes);
 REXCVAR_DECLARE(std::string, ac6_fix_hoisted_fetch_gradients_hashes);
 REXCVAR_DECLARE(bool, param_gen_integer_guest_position);
 REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
+REXCVAR_DECLARE(bool, vfetch_index_rounding_bias);
 REXCVAR_DECLARE(std::string, log_level);
 REXCVAR_DECLARE(bool, ac6_d3d_trace);
 REXCVAR_DECLARE(bool, ac6_backend_debug_swap);
 REXCVAR_DECLARE(bool, ac6_backend_log_signatures);
 REXCVAR_DECLARE(bool, ac6_backend_signature_diagnostics);
+#if defined(_WIN32)
 REXCVAR_DECLARE(bool, ac6_texture_swaps_dump_enabled);
+#endif
 
 #if REX_HAS_VULKAN
 #define AC6_DEFAULT_GRAPHICS_BACKEND "vulkan"
@@ -67,8 +70,13 @@ REXCVAR_DEFINE_BOOL(ac6_fix_water_line, true, "AC6/Fixes",
 #include "generated/ac6recomp_config.h"
 #include "generated/ac6recomp_init.h"
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include "ac6recomp_app.h"
 
@@ -76,6 +84,18 @@ REXCVAR_DEFINE_BOOL(ac6_fix_water_line, true, "AC6/Fixes",
 std::ofstream g_boot_log;
 
 namespace {
+
+void EnableAc6DiagnosticAttachIfRequested() {
+#if defined(__linux__)
+    const char* requested = std::getenv("AC6_ALLOW_DEBUG_ATTACH");
+    if (!requested || !requested[0] || requested[0] == '0') {
+        return;
+    }
+    const int result = prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+    std::cout << "AC6 diagnostic debugger attach "
+              << (result == 0 ? "enabled" : "failed") << std::endl;
+#endif
+}
 
 bool ShouldApplyAc6HybridStartupSafetyOverrides() {
     return REXCVAR_GET(ac6_native_graphics_enabled) &&
@@ -114,6 +134,11 @@ void ApplyAc6DefaultSettings() {
     rex::cvar::SetSessionDefault("d3d12_max_frame_latency", "1");
 #endif
     rex::cvar::SetSessionDefault("vfetch_index_rounding_bias", "true");
+    // This is an AC6 correctness requirement, not a user-tunable preference.
+    // Force the live value after config loading and before Runtime::Setup so
+    // every default shader Modification carries the matching cache-key bit.
+    // REXCVAR_SET deliberately leaves the user's saved value untouched.
+    REXCVAR_SET(vfetch_index_rounding_bias, true);
     rex::cvar::SetSessionDefault("direct_host_resolve", "false");
     rex::cvar::SetSessionDefault("video_mode_width", "1920");
     rex::cvar::SetSessionDefault("video_mode_height", "1080");
@@ -161,7 +186,9 @@ void EnforceAc6PerformanceModeOverrides() {
     REXCVAR_SET(ac6_backend_debug_swap, false);
     REXCVAR_SET(ac6_backend_log_signatures, false);
     REXCVAR_SET(ac6_backend_signature_diagnostics, false);
+#if defined(_WIN32)
     REXCVAR_SET(ac6_texture_swaps_dump_enabled, false);
+#endif
 }
 
 void ApplyAc6FixDefaults() {
@@ -215,8 +242,10 @@ void ApplyAc6FixDefaults() {
 // rex::cvar::LoadConfig parsed the user's toml (so the master switches and
 // gates read the user's real values, fixing the "ac6_fix_* dead from the
 // toml" bug) and BEFORE anything consumes cvars (logging, window, graphics).
-// Everything goes through SetSessionDefault: a user-set value always wins,
-// and none of these values leak into the user's config on a settings save.
+// Preferences go through SetSessionDefault: a user-set value wins and none of
+// them leak into a settings save. The vertex-fetch precision correction is the
+// sole exception: ApplyAc6DefaultSettings forces it because shaders with the
+// correction disabled are not correct for AC6.
 // The game-specific fix constants stay here in code, not in the user's toml.
 void ApplyAc6ConfigPresets() {
     rex::cvar::SetSessionDefault("log_file", "ac6recomp.log");
@@ -240,13 +269,30 @@ void ApplyAc6PerformanceModeOverridesPublic() {
 // This is the support line: it shows whether a master switch genuinely
 // disengaged its payload.
 void LogAc6ConfigPresetSummary() {
-    REXLOG_ERROR("AC6 config: graphics mode={} capture={}", REXCVAR_GET(ac6_graphics_mode),
-                 REXCVAR_GET(ac6_render_capture) ? "true" : "false");
+    REXLOG_ERROR("AC6 config: graphics mode={} capture={} vfetch_bias={}",
+                 REXCVAR_GET(ac6_graphics_mode),
+                 REXCVAR_GET(ac6_render_capture) ? "true" : "false",
+                 REXCVAR_GET(vfetch_index_rounding_bias) ? "true" : "false");
     REXLOG_ERROR("AC6 fixes: scaling={} deswizzle={} dof={} water_line={} perf_mode={} "
                  "unlock_fps={}",
                  REXCVAR_GET(ac6_fix_scaling), REXCVAR_GET(ac6_fix_deswizzle),
                  REXCVAR_GET(ac6_fix_dof), REXCVAR_GET(ac6_fix_water_line),
                  REXCVAR_GET(ac6_performance_mode), REXCVAR_GET(ac6_unlock_fps));
+    // Benchmark support line: use registry queries for SDK-owned CVars so
+    // this remains safe when their definitions live across a shared-library
+    // boundary. Any requested/effective mismatch invalidates a timing arm.
+    REXLOG_ERROR(
+        "AC6 benchmark effective: target_fps={:.0f} unlock_fps={} perf_mode={} "
+        "present_max_in_flight={} present_overlap_telemetry={} "
+        "primitive_cache_min_indices={} clear_memory_page_state={} rect_clear={}",
+        rex::cvar::Query<double>("ac6_fps_target"),
+        rex::cvar::Query<bool>("ac6_unlock_fps"),
+        rex::cvar::Query<bool>("ac6_performance_mode"),
+        rex::cvar::Query<uint32_t>("ac6_present_max_in_flight"),
+        rex::cvar::Query<bool>("ac6_present_overlap_telemetry"),
+        rex::cvar::Query<int32_t>("primitive_processor_cache_min_indices"),
+        rex::cvar::Query<bool>("clear_memory_page_state"),
+        rex::cvar::Query<bool>("vulkan_ac6_rect_clear_lowering"));
     REXLOG_ERROR("AC6 fix payloads: neutralize='{}' snap='{}' densify_x='{}' densify_y='{}' "
                  "hoisted_gradients='{}' param_gen={}/{}",
                  REXCVAR_GET(ac6_neutralize_deswizzle_hashes),
@@ -287,6 +333,7 @@ REX_DEFINE_APP(ac6recomp, Ac6recompAppCreate)
 // Hook into static initialization to start log early
 struct EarlyBoot {
     EarlyBoot() {
+        EnableAc6DiagnosticAttachIfRequested();
         InitEarlyLog();
     }
 } g_early_boot;

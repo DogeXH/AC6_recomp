@@ -23,6 +23,16 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if REX_HAVE_AC6NET
+#include <string>
+
+#include <fmt/format.h>
+
+#include <ac6net/log.h>
+
+#include "netplay_glue.h"
+#endif
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -540,7 +550,41 @@ ppc_u32_result_t XamShowCommunitySessionsUI_entry(ppc_unknown_t r3, ppc_unknown_
   return X_ERROR_FUNCTION_FAILED;
 }
 
-uint32_t XamShowMessageBoxUIEx_entry() {
+// Signature as in Xenia (xam_ui.cc:440-449). AC6's only caller (rex_sub_821F5BA8) passes
+// result_ptr and overlapped on the stack, then waits on the overlapped if it gets IO_PENDING.
+u32 XamShowMessageBoxUIEx_entry(u32 user_index, u32 title_ptr, u32 text_ptr, u32 button_count,
+                                u32 button_ptrs, u32 active_button, u32 flags, u32 unknown,
+                                ppc_pu32_t result_ptr, ppc_pvoid_t overlapped) {
+#if REX_HAVE_AC6NET
+  if (netplay::Enabled()) {
+    // Netplay: never leave an online error dialog pending. Log it and complete the overlapped
+    // with button 0 (MESSAGEBOX_RESULT.dwButtonPressed).
+    auto* memory = REX_KERNEL_MEMORY();
+    std::u16string title, text;
+    if (title_ptr) {
+      netplay::ReadGuestString16(memory, title_ptr, 256, &title);
+    }
+    if (text_ptr) {
+      netplay::ReadGuestString16(memory, text_ptr, 1024, &text);
+    }
+    const std::string title_utf8 = rex::string::to_utf8(title);
+    const std::string text_utf8 = rex::string::to_utf8(text);
+    REXKRNL_WARN("XamShowMessageBoxUIEx (netplay, auto button 0): '{}' / '{}'", title_utf8,
+                 text_utf8);
+    if (ac6net::TraceEnabled()) {
+      ac6net::Trace("xam.msgbox", fmt::format("\"title\":\"{}\",\"text\":\"{}\"",
+                                              ac6net::JsonEscape(title_utf8),
+                                              ac6net::JsonEscape(text_utf8)));
+    }
+    auto run = [result_ptr]() -> X_RESULT {
+      if (result_ptr) {
+        *result_ptr = 0;
+      }
+      return X_ERROR_SUCCESS;
+    };
+    return xeXamDispatchHeadless(run, overlapped.guest_address());
+  }
+#endif
   // TODO(tomc): implement properly
   static bool warned = false;
   if (!warned) {
@@ -549,6 +593,38 @@ uint32_t XamShowMessageBoxUIEx_entry() {
   }
   return 0;
 }
+
+#if REX_HAVE_AC6NET
+// Friends, gamer card and player review UIs: there is no guide overlay, so with netplay on they
+// succeed and pulse XN_SYS_UI on/off (AC6's listener rex_sub_821CE1A0 handles id 9). With netplay
+// off they keep the stub behaviour (log, r3 unchanged).
+u32 XamShowFriendsUI_entry(u32 user_index) {
+  if (!netplay::Enabled()) {
+    REXKRNL_WARN("{} STUB", "__imp__XamShowFriendsUI");
+    return user_index;
+  }
+  netplay::PulseSystemUi();
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamShowGamerCardUIForXUID_entry(u32 user_index, ppc_u64_t xuid) {
+  if (!netplay::Enabled()) {
+    REXKRNL_WARN("{} STUB", "__imp__XamShowGamerCardUIForXUID");
+    return user_index;
+  }
+  netplay::PulseSystemUi();
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamShowPlayerReviewUI_entry(u32 user_index, ppc_u64_t xuid) {
+  if (!netplay::Enabled()) {
+    REXKRNL_WARN("{} STUB", "__imp__XamShowPlayerReviewUI");
+    return user_index;
+  }
+  netplay::PulseSystemUi();
+  return X_ERROR_SUCCESS;
+}
+#endif  // REX_HAVE_AC6NET
 
 }  // namespace xam
 }  // namespace kernel
@@ -599,12 +675,20 @@ XAM_EXPORT_STUB(__imp__XamShowFitnessWarnAboutTimeUI);
 XAM_EXPORT_STUB(__imp__XamShowFofUI);
 XAM_EXPORT_STUB(__imp__XamShowForcedNameChangeUI);
 XAM_EXPORT_STUB(__imp__XamShowFriendRequestUI);
+#if REX_HAVE_AC6NET
+XAM_EXPORT(__imp__XamShowFriendsUI, rex::kernel::xam::XamShowFriendsUI_entry)
+#else
 XAM_EXPORT_STUB(__imp__XamShowFriendsUI);
+#endif
 XAM_EXPORT_STUB(__imp__XamShowFriendsUIp);
 XAM_EXPORT_STUB(__imp__XamShowGameInviteUI);
 XAM_EXPORT_STUB(__imp__XamShowGameVoiceChannelUI);
 XAM_EXPORT_STUB(__imp__XamShowGamerCardUI);
+#if REX_HAVE_AC6NET
+XAM_EXPORT(__imp__XamShowGamerCardUIForXUID, rex::kernel::xam::XamShowGamerCardUIForXUID_entry)
+#else
 XAM_EXPORT_STUB(__imp__XamShowGamerCardUIForXUID);
+#endif
 XAM_EXPORT_STUB(__imp__XamShowGamerCardUIForXUIDp);
 XAM_EXPORT_STUB(__imp__XamShowGamesUI);
 XAM_EXPORT_STUB(__imp__XamShowGenericOnlineAppUI);
@@ -661,7 +745,11 @@ XAM_EXPORT_STUB(__imp__XamShowPasscodeVerifyUI);
 XAM_EXPORT_STUB(__imp__XamShowPasscodeVerifyUIEx);
 XAM_EXPORT_STUB(__imp__XamShowPaymentOptionsUI);
 XAM_EXPORT_STUB(__imp__XamShowPersonalizationUI);
+#if REX_HAVE_AC6NET
+XAM_EXPORT(__imp__XamShowPlayerReviewUI, rex::kernel::xam::XamShowPlayerReviewUI_entry)
+#else
 XAM_EXPORT_STUB(__imp__XamShowPlayerReviewUI);
+#endif
 XAM_EXPORT_STUB(__imp__XamShowPlayersUI);
 XAM_EXPORT_STUB(__imp__XamShowPrivateChatInviteUI);
 XAM_EXPORT_STUB(__imp__XamShowQuickChatUI);

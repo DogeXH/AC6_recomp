@@ -11,6 +11,7 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -20,12 +21,64 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 
-REXCVAR_DECLARE(bool, vfetch_index_rounding_bias);
-
 namespace rex::graphics {
+
+namespace {
+
+// Returns whether a guest shader hash and texture-fetch slot are present in a
+// list of "<hex-hash>[:<slot>[+<slot>...]]" tokens. This mirrors the DXBC
+// translator's allowlist parser so game-specific texture-layout corrections
+// configured by the application also reach the Vulkan/SPIR-V backend.
+bool UcodeHashSlotInList(uint64_t hash, uint32_t tfetch_index,
+                         const std::string& list) {
+  auto is_separator = [](char character) {
+    return character == ',' || character == ';' || character == ' ' ||
+           character == '\t' || character == '\n' || character == '\r';
+  };
+  size_t list_offset = 0;
+  while (list_offset < list.size()) {
+    while (list_offset < list.size() && is_separator(list[list_offset])) {
+      ++list_offset;
+    }
+    size_t token_start = list_offset;
+    while (list_offset < list.size() && !is_separator(list[list_offset])) {
+      ++list_offset;
+    }
+    if (list_offset == token_start) {
+      continue;
+    }
+    std::string token = list.substr(token_start, list_offset - token_start);
+    size_t slot_separator = token.find(':');
+    std::string hash_string =
+        slot_separator == std::string::npos ? token : token.substr(0, slot_separator);
+    if (std::strtoull(hash_string.c_str(), nullptr, 16) != hash) {
+      continue;
+    }
+    if (slot_separator == std::string::npos) {
+      return true;
+    }
+    size_t slot_start = slot_separator + 1;
+    while (slot_start < token.size()) {
+      size_t slot_end = token.find('+', slot_start);
+      if (slot_end == std::string::npos) {
+        slot_end = token.size();
+      }
+      if (slot_end > slot_start &&
+          std::strtoul(token.substr(slot_start, slot_end - slot_start).c_str(),
+                       nullptr, 10) == tfetch_index) {
+        return true;
+      }
+      slot_start = slot_end + 1;
+    }
+  }
+  return false;
+}
+
+}  // namespace
 
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
@@ -83,7 +136,8 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
       if (instr.attributes.is_index_rounded) {
         index = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, index,
                                                    builder_->makeFloatConstant(0.5f));
-      } else if (REXCVAR_GET(vfetch_index_rounding_bias)) {
+      } else if (GetSpirvShaderModification().value &
+                 Modification::kVfetchIndexRoundingBiasMask) {
         index = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, index,
                                                    builder_->makeFloatConstant(0.00025f));
       }
@@ -598,6 +652,25 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     uint32_t fetch_constant_index = instr.operands[1].storage_index;
     uint32_t fetch_constant_word_0_index = 6 * fetch_constant_index;
 
+    // AC6 performs a manual Xenos EDRAM sub-tile de-swizzle in two full-screen
+    // restore/compositor shaders. ReXGlue has already detiled the source into a
+    // linear texture, so applying the guest de-swizzle again permutes texels.
+    // The DXBC translator corrects the allowlisted fetches, but the SPIR-V path
+    // historically did not, leaving the Vulkan world compositor black and
+    // corrupting shadowed regions.
+    bool apply_deswizzle_identity = false;
+    if (instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        GetSpirvShaderModification().pixel.param_gen_enable) {
+      const std::string neutralize_hashes =
+          REXCVAR_QUERY(std::string, ac6_neutralize_deswizzle_hashes);
+      apply_deswizzle_identity =
+          !neutralize_hashes.empty() &&
+          UcodeHashSlotInList(current_shader().ucode_data_hash(), fetch_constant_index,
+                              neutralize_hashes);
+    }
+
     spv::Id sampler = spv::NoResult;
     spv::Id image_2d_array_or_cube_unsigned = spv::NoResult;
     spv::Id image_2d_array_or_cube_signed = spv::NoResult;
@@ -823,6 +896,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           size_needed_components &= 0b0011;
           break;
       }
+    }
+    if (apply_deswizzle_identity) {
+      // Identity UV construction below needs the guest width and height even
+      // though this is otherwise an ordinary normalized-coordinate fetch.
+      size_needed_components |= 0b011;
     }
     if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
       // Stacked and 3D textures have different size packing - need to get
@@ -1098,6 +1176,26 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             coordinate_ref = builder_->createNoContractionBinOp(
                 spv::OpFAdd, type_float_, coordinate_ref, component_offset_normalized);
           }
+        }
+      }
+      if (apply_deswizzle_identity) {
+        // Match the DXBC AC6 correction exactly: replace the guest's manually
+        // de-swizzled coordinate with the 1:1 linear host-texel coordinate,
+        // gl_FragCoord.xy / (guest_size * draw_resolution_scale).
+        assert_true(input_fragment_coordinates_ != spv::NoResult);
+        assert_true(size[0] != spv::NoResult && size[1] != spv::NoResult);
+        spv::Id fragment_coordinates =
+            builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
+        const float draw_scales[2] = {float(draw_resolution_scale_x_),
+                                      float(draw_resolution_scale_y_)};
+        for (uint32_t i = 0; i < 2; ++i) {
+          spv::Id fragment_coordinate =
+              builder_->createCompositeExtract(fragment_coordinates, type_float_, i);
+          spv::Id host_size = builder_->createNoContractionBinOp(
+              spv::OpFMul, type_float_, size[i],
+              builder_->makeFloatConstant(draw_scales[i]));
+          coordinates[i] = builder_->createNoContractionBinOp(
+              spv::OpFDiv, type_float_, fragment_coordinate, host_size);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -1414,9 +1512,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id is_any_unsigned =
             builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
+        // The fetch result exponent adjustment is stored in word 3, bits
+        // 13:18. Loading it from word 4 applies an unrelated LOD field and can
+        // collapse AC6's scene resolve source to black on Vulkan.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
+                                            id_vector_temp_),
+                spv::NoPrecision));
+
         // Load the fetch constant word 4, needed unconditionally for LOD
-        // biasing, for result exponent biasing, and conditionally for stacked
-        // texture filtering.
+        // biasing and conditionally for stacked texture filtering.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(const_int_0_);
         id_vector_temp_.push_back(
@@ -2035,11 +2148,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
-        // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // Apply the exponent bias from bits 13:18 of fetch constant word 3.
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;

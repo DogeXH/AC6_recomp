@@ -270,6 +270,36 @@ void main() {
   return source;
 }
 
+// PipelineDescriptionExport (the native renderer's decoder and the Deck pipeline store) is
+// the packed Itanium-ABI layout of PipelineDescription: 32 bytes of shader hashes, the 4-byte
+// render pass key, 45 state bits in 6 bytes (byte 36), then four 4-byte render targets
+// (byte 42): 58 bytes. Under the Microsoft ABI (Windows) a bit-field never straddles its
+// 32-bit allocation unit, so stencil_back_fail_op opens a second unit: every state bit keeps
+// its position, but the state block takes 8 bytes and the render targets start at byte 44
+// (60 bytes). Re-pack into the export layout and hash those bytes, which is exactly
+// memcpy + GetHash() where the layouts already agree.
+constexpr size_t kExportRenderTargetsOffset = 42;
+constexpr size_t kMsAbiRenderTargetsOffset = 44;
+
+template <typename Description>
+uint64_t ExportPipelineDescriptionBytes(
+    const Description& description,
+    uint8_t (&bytes)[VulkanPipelineCache::PipelineDescriptionExport::kSize]) {
+  constexpr size_t kExportSize = VulkanPipelineCache::PipelineDescriptionExport::kSize;
+  if constexpr (sizeof(Description) == kExportSize) {
+    std::memcpy(bytes, &description, kExportSize);
+  } else {
+    static_assert(sizeof(Description) ==
+                      kExportSize + (kMsAbiRenderTargetsOffset - kExportRenderTargetsOffset),
+                  "PipelineDescription layout changed: update the export re-packing");
+    const auto* src = reinterpret_cast<const uint8_t*>(&description);
+    std::memcpy(bytes, src, kExportRenderTargetsOffset);
+    std::memcpy(bytes + kExportRenderTargetsOffset, src + kMsAbiRenderTargetsOffset,
+                kExportSize - kExportRenderTargetsOffset);
+  }
+  return XXH3_64bits(bytes, kExportSize);
+}
+
 }  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(VulkanCommandProcessor& command_processor,
@@ -1045,17 +1075,16 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   return true;
 }
 
-bool VulkanPipelineCache::ConfigurePipeline(
-    VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
+bool VulkanPipelineCache::PreparePipelineDescription(
+    VulkanShader::VulkanTranslation* vertex_shader,
+    VulkanShader::VulkanTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
-#if XE_GPU_FINE_GRAINED_DRAW_SCOPES
-  SCOPE_profile_cpu_f("gpu");
-#endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-
-  // Ensure shaders are translated - needed now for GetCurrentStateDescription.
+    VulkanRenderTargetCache::RenderPassKey render_pass_key,
+    PipelineDescription& description_out) {
+  // Translation and shader-storage bookkeeping are deliberately shared with
+  // ConfigurePipeline. Describing an externally-owned PSO must have the same
+  // shader validity and persistence behavior as the SDK-owned path.
   if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
     return false;
   }
@@ -1082,10 +1111,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
     storage_write_request_cond_.notify_all();
   }
 
-  PipelineDescription description;
-  if (!GetCurrentStateDescription(vertex_shader, pixel_shader, primitive_processing_result,
-                                  normalized_depth_control, normalized_color_mask, render_pass_key,
-                                  description)) {
+  if (!GetCurrentStateDescription(vertex_shader, pixel_shader,
+                                  primitive_processing_result,
+                                  normalized_depth_control,
+                                  normalized_color_mask, render_pass_key,
+                                  description_out)) {
     REXGPU_ERROR(
         "VulkanPipelineCache: GetCurrentStateDescription failed "
         "(guest_prim={}, host_prim={}, host_vs_type={}, tess_mode={}, host_reset={}, "
@@ -1094,7 +1124,172 @@ bool VulkanPipelineCache::ConfigurePipeline(
         uint32_t(primitive_processing_result.host_primitive_type),
         uint32_t(primitive_processing_result.host_vertex_shader_type),
         uint32_t(primitive_processing_result.tessellation_mode),
-        uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
+        uint32_t(primitive_processing_result.host_primitive_reset_enabled),
+        render_pass_key.key);
+    return false;
+  }
+  return true;
+}
+
+bool VulkanPipelineCache::GetGeneratedGeometryShaderForDescription(
+    const PipelineDescription& description,
+    VkShaderModule& generated_geometry_shader_out) {
+  generated_geometry_shader_out = VK_NULL_HANDLE;
+  if (description.geometry_shader == PipelineGeometryShader::kNone) {
+    return true;
+  }
+
+  GeometryShaderKey geometry_shader_key;
+  if (!GetGeometryShaderKey(
+          description.geometry_shader,
+          SpirvShaderTranslator::Modification(
+              description.vertex_shader_modification),
+          SpirvShaderTranslator::Modification(
+              description.pixel_shader_modification),
+          geometry_shader_key)) {
+    REXGPU_ERROR(
+        "VulkanPipelineCache: Failed to derive the generated geometry "
+        "shader key for exported pipeline {:016X}",
+        description.GetHash());
+    return false;
+  }
+  generated_geometry_shader_out = GetGeometryShader(geometry_shader_key);
+  if (generated_geometry_shader_out == VK_NULL_HANDLE) {
+    REXGPU_ERROR(
+        "VulkanPipelineCache: Failed to export the generated geometry "
+        "shader for pipeline {:016X}",
+        description.GetHash());
+    return false;
+  }
+  // This is a borrowed handle. The SDK pipeline cache continues to own and
+  // eventually destroy the shader module.
+  return true;
+}
+
+const VulkanPipelineCache::PipelineLayoutProvider*
+VulkanPipelineCache::GetPipelineLayoutForShaders(
+    const VulkanShader::VulkanTranslation* vertex_shader,
+    const VulkanShader::VulkanTranslation* pixel_shader) {
+  return command_processor_.GetPipelineLayout(
+      pixel_shader ? static_cast<const VulkanShader&>(pixel_shader->shader())
+                         .GetTextureBindingsAfterTranslation()
+                         .size()
+                   : 0,
+      pixel_shader ? static_cast<const VulkanShader&>(pixel_shader->shader())
+                         .GetSamplerBindingsAfterTranslation()
+                         .size()
+                   : 0,
+      static_cast<const VulkanShader&>(vertex_shader->shader())
+          .GetTextureBindingsAfterTranslation()
+          .size(),
+      static_cast<const VulkanShader&>(vertex_shader->shader())
+          .GetSamplerBindingsAfterTranslation()
+          .size());
+}
+
+bool VulkanPipelineCache::DescribePipelineForExternalUse(
+    VulkanShader::VulkanTranslation* vertex_shader,
+    VulkanShader::VulkanTranslation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key,
+    ExternalPipelineDescription& description_out) {
+  description_out = {};
+
+  PipelineDescription description;
+  if (!PreparePipelineDescription(
+          vertex_shader, pixel_shader, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask, render_pass_key,
+          description)) {
+    return false;
+  }
+
+  ExternalPipelineDescription external_description;
+  external_description.hash = ExportPipelineDescriptionBytes(
+      description, external_description.description.bytes);
+  external_description.layout =
+      GetPipelineLayoutForShaders(vertex_shader, pixel_shader);
+  if (!external_description.layout) {
+    REXGPU_ERROR(
+        "VulkanPipelineCache: Failed to obtain the pipeline layout for "
+        "external pipeline {:016X}",
+        external_description.hash);
+    return false;
+  }
+  external_description.vertex_shader =
+      vertex_shader->GetOrCreateShaderModule();
+  if (external_description.vertex_shader == VK_NULL_HANDLE) {
+    REXGPU_ERROR(
+        "VulkanPipelineCache: Failed to export the live vertex shader for "
+        "external pipeline {:016X}",
+        external_description.hash);
+    return false;
+  }
+  if (pixel_shader) {
+    external_description.pixel_shader =
+        pixel_shader->GetOrCreateShaderModule();
+    if (external_description.pixel_shader == VK_NULL_HANDLE) {
+      REXGPU_ERROR(
+          "VulkanPipelineCache: Failed to export the live pixel shader for "
+          "external pipeline {:016X}",
+          external_description.hash);
+      return false;
+    }
+  }
+  if (!GetGeneratedGeometryShaderForDescription(
+          description, external_description.generated_geometry_shader)) {
+    return false;
+  }
+
+  description_out = external_description;
+  return true;
+}
+
+bool VulkanPipelineCache::ConfigurePipeline(
+    VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out,
+    uint64_t* description_hash_out,
+    PipelineDescriptionExport* description_export_out,
+    VkShaderModule* generated_geometry_shader_out) {
+#if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  SCOPE_profile_cpu_f("gpu");
+#endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+
+  if (generated_geometry_shader_out) {
+    *generated_geometry_shader_out = VK_NULL_HANDLE;
+  }
+
+  PipelineDescription description;
+  if (!PreparePipelineDescription(
+          vertex_shader, pixel_shader, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask, render_pass_key,
+          description)) {
+    return false;
+  }
+  if constexpr (sizeof(PipelineDescription) == PipelineDescriptionExport::kSize) {
+    if (description_hash_out) {
+      *description_hash_out = description.GetHash();
+    }
+    if (description_export_out) {
+      std::memcpy(description_export_out->bytes, &description,
+                  sizeof(description));
+    }
+  } else if (description_hash_out || description_export_out) {
+    // Microsoft ABI layout: see ExportPipelineDescriptionBytes.
+    PipelineDescriptionExport description_export_scratch;
+    uint64_t export_hash = ExportPipelineDescriptionBytes(
+        description, description_export_out ? description_export_out->bytes
+                                            : description_export_scratch.bytes);
+    if (description_hash_out) {
+      *description_hash_out = export_hash;
+    }
+  }
+  if (generated_geometry_shader_out &&
+      !GetGeneratedGeometryShaderForDescription(
+          description, *generated_geometry_shader_out)) {
     return false;
   }
   if (last_pipeline_ && last_pipeline_->first == description) {
@@ -2975,21 +3170,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
     }
   }
 
-  const PipelineLayoutProvider* pipeline_layout = command_processor_.GetPipelineLayout(
-      (!for_placeholder && pixel_shader) ? static_cast<const VulkanShader&>(pixel_shader->shader())
-                                               .GetTextureBindingsAfterTranslation()
-                                               .size()
-                                         : 0,
-      (!for_placeholder && pixel_shader) ? static_cast<const VulkanShader&>(pixel_shader->shader())
-                                               .GetSamplerBindingsAfterTranslation()
-                                               .size()
-                                         : 0,
-      static_cast<const VulkanShader&>(vertex_shader->shader())
-          .GetTextureBindingsAfterTranslation()
-          .size(),
-      static_cast<const VulkanShader&>(vertex_shader->shader())
-          .GetSamplerBindingsAfterTranslation()
-          .size());
+  const PipelineLayoutProvider* pipeline_layout = GetPipelineLayoutForShaders(
+      vertex_shader, for_placeholder ? nullptr : pixel_shader);
   if (!pipeline_layout) {
     return fail("pipeline_layout_unavailable");
   }

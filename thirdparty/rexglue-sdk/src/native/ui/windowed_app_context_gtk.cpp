@@ -25,7 +25,11 @@ void GTKWindowedAppContext::NotifyUILoopOfPendingFunctions() {
   std::lock_guard<std::mutex> pending_functions_idle_pending_lock(
       pending_functions_idle_pending_mutex_);
   if (!pending_functions_idle_pending_) {
-    pending_functions_idle_pending_ = gdk_threads_add_idle(PendingFunctionsSourceFunc, this);
+    // Controller event pumping is queued through this path. The default idle
+    // priority may be starved indefinitely while presentation keeps the GTK
+    // loop busy, leaving the guest polling a permanently stale pad state.
+    pending_functions_idle_pending_ = gdk_threads_add_idle_full(
+        G_PRIORITY_HIGH_IDLE, PendingFunctionsSourceFunc, this, nullptr);
   }
 }
 

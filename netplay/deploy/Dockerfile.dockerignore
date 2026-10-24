@@ -1,0 +1,7 @@
+# Build context: netplay/server. Keep secrets, state and local binaries out of the image.
+ac6lobby
+data/
+*.key
+*.token
+*.log
+.git

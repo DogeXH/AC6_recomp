@@ -27,6 +27,18 @@
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <native/platform.h>
+#if REX_PLATFORM_LINUX
+// Deck tuning: the audio threads are pinned with glibc's pthread affinity API.
+#include <pthread.h>
+#include <sched.h>
+#endif
+
+REXCVAR_DEFINE_BOOL(audio_pin_xaudio_dsp_thread, true, "Audio",
+                    "Pin the XAudio DSP render threads (the PCM producers the "
+                    "host mixer blocks on every 256-sample frame; created "
+                    "time-critical on real hardware) to CPU 6 so heavy sim "
+                    "load cannot starve audio production.");
 
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
@@ -554,6 +566,28 @@ void XThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // AC6 XAudio DSP render threads (guest proc 0x823AD848, secondary workers
+  // 0x823AD910) are created with KeSetBasePriorityThread(+15) - time-critical
+  // on real hardware - and render every 256-sample audio frame on demand
+  // (the host audio worker only waits on them). The recomp cannot grant
+  // real-time priority, so isolate them on CPU 6 next to the audio worker;
+  // otherwise 60fps sim load starves them and voice lines stretch.
+  // Linux only (Deck tuning); other platforms keep the scheduler's placement.
+#if REX_PLATFORM_LINUX
+  if (REXCVAR_GET(audio_pin_xaudio_dsp_thread) &&
+      (creation_params_.start_address == 0x823AD848u ||
+       creation_params_.start_address == 0x823AD910u)) {
+    cpu_set_t dsp_cpu_set;
+    CPU_ZERO(&dsp_cpu_set);
+    CPU_SET(6, &dsp_cpu_set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(dsp_cpu_set), &dsp_cpu_set) == 0) {
+      pthread_setname_np(pthread_self(), "AC6 XAudioDSP");
+      REXSYS_INFO("XAudio DSP render thread (start {:08X}) pinned to CPU 6.",
+                  creation_params_.start_address);
+    }
+  }
+#endif  // REX_PLATFORM_LINUX
+
   // Dispatch any APCs that were queued before the thread was created first.
   DeliverAPCs();
 
@@ -818,14 +852,17 @@ void XThread::SetPriority(int32_t increment) {
   auto kthread = guest_object<X_KTHREAD>();
   kthread->priority = static_cast<uint8_t>(std::clamp(increment, 0, 31));
 
+  // Base-priority increments use the +/-16 Xbox scale; the previous
+  // thresholds (0x22/0x11) were unreachable, so time-critical guest requests
+  // (e.g. +15 for the XAudio DSP threads) silently mapped to kNormal.
   int32_t target_priority = 0;
-  if (increment > 0x22) {
+  if (increment >= 12) {
     target_priority = rex::thread::ThreadPriority::kHighest;
-  } else if (increment > 0x11) {
+  } else if (increment >= 6) {
     target_priority = rex::thread::ThreadPriority::kAboveNormal;
-  } else if (increment < -0x22) {
+  } else if (increment <= -12) {
     target_priority = rex::thread::ThreadPriority::kLowest;
-  } else if (increment < -0x11) {
+  } else if (increment <= -6) {
     target_priority = rex::thread::ThreadPriority::kBelowNormal;
   } else {
     target_priority = rex::thread::ThreadPriority::kNormal;

@@ -42,6 +42,7 @@ REXCVAR_DEFINE_INT32(
 REXCVAR_DEFINE_INT32(audio_startup_max_callback_lead_frames, 2, "Audio",
                      "Maximum queued/submitted callback lead before first real playback consumption")
     .range(1, 8);
+REXCVAR_DECLARE(bool, audio_trace_telemetry);
 
 namespace rex::audio {
 
@@ -135,6 +136,14 @@ AudioDriverTelemetry MergeDriverTelemetry(const AudioClientState& client) {
       std::max(merged.callback_dispatch_count, driver_telemetry.callback_dispatch_count);
   merged.callback_throttle_count =
       std::max(merged.callback_throttle_count, driver_telemetry.callback_throttle_count);
+  merged.explicit_silence_submissions =
+      std::max(merged.explicit_silence_submissions,
+               driver_telemetry.explicit_silence_submissions);
+  merged.zero_output_frames =
+      std::max(merged.zero_output_frames, driver_telemetry.zero_output_frames);
+  merged.nonzero_output_frames =
+      std::max(merged.nonzero_output_frames,
+               driver_telemetry.nonzero_output_frames);
   return merged;
 }
 
@@ -354,6 +363,11 @@ void AudioRuntime::Shutdown() {
       if (worker_wake_event_) {
         worker_wake_event_->Set();
       }
+      {
+        std::lock_guard<std::mutex> wake_lock(worker_wake_mutex_);
+        worker_wake_pending_ = true;
+      }
+      worker_wake_cv_.notify_all();
     }
   }
 
@@ -429,9 +443,11 @@ X_STATUS AudioRuntime::RegisterClient(const uint32_t callback, const uint32_t ca
     *out_index = i;
 
     // Wake the worker so it can start dispatching callbacks for this client
-    if (worker_wake_event_) {
-      worker_wake_event_->Set();
+    {
+      std::lock_guard<std::mutex> wake_lock(worker_wake_mutex_);
+      worker_wake_pending_ = true;
     }
+    worker_wake_cv_.notify_one();
 
     return X_STATUS_SUCCESS;
   }
@@ -806,13 +822,17 @@ void AudioRuntime::WorkerThreadMain() {
               QueueDepthLimit(), StartupCallbackMinSpacingMs(),
               StartupMaxCallbackLeadFrames());
 
-  rex::thread::WaitHandle* wait_handles[2]{};
-  wait_handles[0] = worker_wake_event_.get();
-  wait_handles[1] = shutdown_event_.get();
-
   while (worker_running_.load(std::memory_order_acquire)) {
-    // Wait for: host driver wake, shutdown, or 5ms timeout
-    rex::thread::WaitAny(wait_handles, 2, true, std::chrono::milliseconds(5));
+    // Wait for: host driver wake, shutdown, or 5ms timeout. A plain condition
+    // variable: the generic WaitAny path (PosixConditionBase::WaitMultiple)
+    // costs sem_open + pthread_sigqueue per cycle - far too heavy for a
+    // 187 Hz loop (measured ~6% of total process CPU).
+    {
+      std::unique_lock<std::mutex> wake_lock(worker_wake_mutex_);
+      worker_wake_cv_.wait_for(wake_lock, std::chrono::milliseconds(5),
+                               [this]() { return worker_wake_pending_; });
+      worker_wake_pending_ = false;
+    }
 
     if (!worker_running_.load(std::memory_order_acquire)) {
       break;
@@ -1006,27 +1026,49 @@ void AudioRuntime::WorkerThreadMain() {
       }
     }
 
-    // Periodic telemetry - every ~3 seconds at DEBUG level
+    // Periodic telemetry - every ~3 seconds. Keep the normal path at DEBUG,
+    // but make the explicitly requested diagnostic visible in performance
+    // profiles whose configured log level filters INFO and DEBUG.
     if (!startup_trace && (worker_iteration_count_ % 600) == 0) {
       std::lock_guard<std::mutex> lock(mutex_);
       for (size_t i = 0; i < clients_.size(); ++i) {
         if (!clients_[i].in_use) continue;
         const auto& c = clients_[i];
-        REXAPU_DEBUG(
-            "AudioRuntime periodic: client={} queued={} target={} low_water={} submitted={} "
-            "consumed={} queued_played={} underruns={} callbacks={} tic={} synthetic_tic={} submitted_tic={} "
-            "startup_cap_tic={} startup_inflight={} callback_throttles={} callback_empty={} "
-            "last_callback_frames={} last_callback_us={} peak={} drift_ms={:.1f}",
-            i, c.queued_frames.size(), EffectiveCallbackTargetQueueDepth(c),
-            EffectiveCallbackLowWaterFrames(c), c.telemetry.submitted_frames,
-            c.telemetry.consumed_frames, c.queued_played_frames, c.telemetry.underrun_count,
-            c.telemetry.callback_dispatch_count, ComputeRenderDriverTic(c),
-            ComputeStartupSyntheticTic(c), SubmittedTicSamples(c), StartupTicCapSamples(c),
-            StartupInflightFrames(c), c.telemetry.callback_throttle_count,
-            c.telemetry.callback_empty_count, c.telemetry.last_callback_produced_frames,
-            c.telemetry.last_callback_duration_us,
-            c.telemetry.peak_queued_depth,
-            c.clock.drift_ms());
+        if (REXCVAR_GET(audio_trace_telemetry)) {
+          const AudioDriverTelemetry telemetry = MergeDriverTelemetry(c);
+          REXAPU_ERROR(
+              "AudioRuntime diagnostic: client={} runtime_queued={} target={} low_water={} "
+              "submitted={} consumed={} underruns={} silence_injections={} dropped={} "
+              "explicit_silence={} zero_output={} nonzero_output={} malformed={} "
+              "callbacks={} callback_empty_run={} last_callback_frames={} "
+              "last_callback_us={} driver_queue={} peak={} drift_ms={:.1f}",
+              i, c.queued_frames.size(), EffectiveCallbackTargetQueueDepth(c),
+              EffectiveCallbackLowWaterFrames(c), telemetry.submitted_frames,
+              telemetry.consumed_frames, telemetry.underrun_count,
+              telemetry.silence_injections, telemetry.dropped_frames,
+              telemetry.explicit_silence_submissions,
+              telemetry.zero_output_frames, telemetry.nonzero_output_frames,
+              telemetry.malformed_frames, telemetry.callback_dispatch_count,
+              telemetry.callback_empty_count, telemetry.last_callback_produced_frames,
+              telemetry.last_callback_duration_us, telemetry.queued_depth,
+              telemetry.peak_queued_depth, c.clock.drift_ms());
+        } else {
+          REXAPU_DEBUG(
+              "AudioRuntime periodic: client={} queued={} target={} low_water={} submitted={} "
+              "consumed={} queued_played={} underruns={} callbacks={} tic={} synthetic_tic={} "
+              "submitted_tic={} startup_cap_tic={} startup_inflight={} callback_throttles={} "
+              "callback_empty={} last_callback_frames={} last_callback_us={} peak={} drift_ms={:.1f}",
+              i, c.queued_frames.size(), EffectiveCallbackTargetQueueDepth(c),
+              EffectiveCallbackLowWaterFrames(c), c.telemetry.submitted_frames,
+              c.telemetry.consumed_frames, c.queued_played_frames,
+              c.telemetry.underrun_count, c.telemetry.callback_dispatch_count,
+              ComputeRenderDriverTic(c), ComputeStartupSyntheticTic(c),
+              SubmittedTicSamples(c), StartupTicCapSamples(c), StartupInflightFrames(c),
+              c.telemetry.callback_throttle_count, c.telemetry.callback_empty_count,
+              c.telemetry.last_callback_produced_frames,
+              c.telemetry.last_callback_duration_us, c.telemetry.peak_queued_depth,
+              c.clock.drift_ms());
+        }
       }
     }
   }
@@ -1039,9 +1081,11 @@ uint64_t AudioRuntime::NextTickLocked() {
 }
 
 void AudioRuntime::WakeWorker() {
-  if (worker_wake_event_) {
-    worker_wake_event_->Set();
+  {
+    std::lock_guard<std::mutex> wake_lock(worker_wake_mutex_);
+    worker_wake_pending_ = true;
   }
+  worker_wake_cv_.notify_one();
 }
 
 }  // namespace rex::audio

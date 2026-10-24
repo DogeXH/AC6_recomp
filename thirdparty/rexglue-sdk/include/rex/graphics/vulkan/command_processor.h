@@ -47,6 +47,13 @@ namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
+  // Trace-harness diagnostic only: exposes the exact CPU-side bytes uploaded
+  // to the system-constants UBO for native-renderer parity checks.
+  const SpirvShaderTranslator::SystemConstants&
+  GetSystemConstantsForTraceDiagnostic() const {
+    return system_constants_;
+  }
+
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
@@ -159,6 +166,28 @@ class VulkanCommandProcessor : public CommandProcessor {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+
+  // Trace-harness-only GPU attribution result. Command indices are guest draw
+  // command ordinals (copy-mode draws included), matching the scan TSV for a
+  // trace whose only terminal non-draw command is the swap.
+  static constexpr size_t kAc6Nr2HotpathPhaseCount = 15;
+  struct Ac6GpuPassProfileBucket {
+    uint32_t first_command = 0;
+    uint32_t last_command = 0;
+    uint32_t draw_count = 0;
+    uint32_t copy_count = 0;
+    bool includes_swap = false;
+    double gpu_milliseconds = 0.0;
+    double cpu_issue_draw_milliseconds = 0.0;
+    std::array<double, kAc6Nr2HotpathPhaseCount>
+        cpu_issue_draw_phase_milliseconds = {};
+  };
+
+  // Call only after the trace harness has waited for the Vulkan device to go
+  // idle. Returns false when profiling was not enabled, the frame has not
+  // closed, or timestamp results are unavailable.
+  bool ReadAc6GpuPassProfile(
+      std::vector<Ac6GpuPassProfileBucket>& buckets_out) const;
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
@@ -449,6 +478,29 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
+
+  static constexpr uint32_t kAc6GpuPassProfileMaxTimestamps = 4096;
+  struct Ac6GpuPassProfilePendingBucket {
+    uint32_t first_command = 0;
+    uint32_t last_command = 0;
+    uint32_t draw_count = 0;
+    uint32_t copy_count = 0;
+    bool includes_swap = false;
+    uint64_t cpu_issue_draw_nanoseconds = 0;
+    std::array<uint64_t, kAc6Nr2HotpathPhaseCount>
+        cpu_issue_draw_phase_nanoseconds = {};
+  };
+  class Ac6GpuPassProfileCpuTimer;
+  bool InitializeAc6GpuPassProfile();
+  void ShutdownAc6GpuPassProfile();
+  void BeginAc6GpuPassProfileFrame();
+  void BeginAc6GpuPassProfileGuestCommand(bool is_copy);
+  void AddAc6GpuPassProfileGuestCommandCpuTime(
+      uint64_t nanoseconds,
+      const std::array<uint64_t, kAc6Nr2HotpathPhaseCount>&
+          phase_nanoseconds);
+  void EndAc6GpuPassProfileFrame();
+  bool AppendAc6GpuPassProfileBoundary(bool includes_swap);
   struct ReadbackBuffer {
     VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -503,6 +555,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
+  void RecordAc6WorldIdentityDraw(xenos::EdramMode edram_mode);
+  bool IsAc6WorldIdentityDrawState() const;
+  void EmitAndResetAc6WorldIdentityTelemetry(uint32_t frontbuffer_width,
+                                             uint32_t frontbuffer_height);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -549,6 +605,9 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
+  // Submit overly long deferred streams without advancing the guest frame.
+  // Only XE_SWAP is allowed to close the logical frame.
+  uint32_t primary_buffer_ends_without_present_ = 0;
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
@@ -558,6 +617,33 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
+
+  struct Ac6WorldIdentityDrawTelemetry {
+    uint64_t draw_commands = 0;
+    uint64_t surface_key_hits = 0;
+    uint64_t surface_semantic_alias_hits = 0;
+    uint64_t color_key_hits = 0;
+    uint64_t color_resource_alias_hits = 0;
+    uint64_t depth_key_hits = 0;
+    uint64_t candidate_draws = 0;
+    uint64_t candidate_left = 0;
+    uint64_t candidate_right = 0;
+    uint64_t candidate_partition_unexpected = 0;
+    uint64_t candidate_viewport_scissor_unexpected = 0;
+    uint64_t candidate_mrt_register_state = 0;
+    uint64_t candidate_active_mrt = 0;
+    uint64_t candidate_mode4_left = 0;
+    uint64_t candidate_mode4_right = 0;
+    uint64_t candidate_mode4_unexpected = 0;
+    uint64_t candidate_mode5_left = 0;
+    uint64_t candidate_mode5_right = 0;
+    uint64_t candidate_mode5_unexpected = 0;
+    uint64_t candidate_mode6_left = 0;
+    uint64_t candidate_mode6_right = 0;
+    uint64_t candidate_mode6_unexpected = 0;
+    uint64_t candidate_other_mode = 0;
+  } ac6_world_identity_draw_telemetry_;
+  uint64_t ac6_world_identity_swap_index_ = 0;
 
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;
@@ -758,6 +844,26 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+
+  VkQueryPool ac6_gpu_pass_profile_query_pool_ = VK_NULL_HANDLE;
+  double ac6_gpu_pass_profile_timestamp_period_ns_ = 0.0;
+  uint32_t ac6_gpu_pass_profile_timestamp_valid_bits_ = 0;
+  uint32_t ac6_gpu_pass_profile_interval_ = 0;
+  uint32_t ac6_gpu_pass_profile_query_count_ = 0;
+  uint32_t ac6_gpu_pass_profile_command_count_ = 0;
+  uint32_t ac6_gpu_pass_profile_range_first_command_ = 0;
+  uint32_t ac6_gpu_pass_profile_range_command_count_ = 0;
+  uint32_t ac6_gpu_pass_profile_range_draw_count_ = 0;
+  uint32_t ac6_gpu_pass_profile_range_copy_count_ = 0;
+  uint64_t ac6_gpu_pass_profile_range_cpu_issue_draw_nanoseconds_ = 0;
+  std::array<uint64_t, kAc6Nr2HotpathPhaseCount>
+      ac6_gpu_pass_profile_range_cpu_issue_draw_phase_nanoseconds_ = {};
+  bool ac6_gpu_pass_profile_previous_command_was_copy_ = false;
+  bool ac6_gpu_pass_profile_frame_active_ = false;
+  bool ac6_gpu_pass_profile_frame_ready_ = false;
+  bool ac6_gpu_pass_profile_overflow_logged_ = false;
+  std::vector<Ac6GpuPassProfilePendingBucket>
+      ac6_gpu_pass_profile_pending_buckets_;
   static constexpr uint32_t kVertexFetchConstantCount = 96;
   // Bit is set when the vertex buffer at that index has been requested in the
   // current frame. Cleared between frames and on fetch constant writes.
@@ -802,6 +908,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
+
+  // Contents of the last successfully written transient texture/sampler
+  // descriptor set of each stage, for reuse across draws when the bindings
+  // and the descriptor set layout are unchanged
+  // (vulkan_reuse_texture_descriptors). Reuse is scoped to the submission
+  // recorded in the entry; entries are also invalidated at frame open (where
+  // old transient sets are recycled) and in ClearTransientDescriptorPools.
+  struct ReusableTextureDescriptorSetState {
+    bool valid = false;
+    // The submission the set was written in - reuse is limited to the same
+    // submission (see the reuse block in UpdateBindings for the proof).
+    uint64_t submission = 0;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    // Texture image infos followed by sampler image infos, byte-exactly as
+    // written to the set.
+    std::vector<VkDescriptorImageInfo> image_info;
+  };
+  ReusableTextureDescriptorSetState reusable_texture_descriptors_vertex_;
+  ReusableTextureDescriptorSetState reusable_texture_descriptors_pixel_;
 
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE

@@ -27,6 +27,8 @@ set(REXKERNEL_SOURCES
     xam/xam_video.cpp
     xam/xam_voice.cpp
     xam/xam_misc.cpp
+    # AC6 online glue; compiles to nothing unless the app links ac6net (REX_HAVE_AC6NET=1).
+    xam/netplay_glue.cpp
     xam/apps/xam_app.cpp
     xam/apps/xgi_app.cpp
     xam/apps/xlivebase_app.cpp

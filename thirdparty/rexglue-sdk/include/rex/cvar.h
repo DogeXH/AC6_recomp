@@ -123,6 +123,10 @@ enum class Lifecycle {
   kRequiresRestart  // Can be changed, but only takes effect after restart
 };
 
+// Highest-priority per-launch source that has set a flag. TOML remains the
+// persisted user preference, but must not replace either launch override.
+enum class LaunchOverrideSource { kNone, kCommandLine, kEnvironment };
+
 // Validation constraints
 struct Constraints {
   std::optional<double> min;
@@ -165,6 +169,9 @@ struct FlagEntry {
   bool has_session_default = false;
   std::string session_default;
   std::string session_driver;
+  // Live startup precedence is environment > command line > TOML > default.
+  // TOML still records user_set/user_value when a launch override wins.
+  LaunchOverrideSource launch_override_source = LaunchOverrideSource::kNone;
 };
 
 std::vector<FlagEntry>& GetRegistry();

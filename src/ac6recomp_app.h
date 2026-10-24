@@ -14,8 +14,12 @@
 #endif
 
 #include "ac6_native_graphics.h"
+#include "ac6_native_renderer2/native_renderer.h"
 #include "ac6_native_graphics_overlay.h"
 #include "render_hooks.h"
+#if AC6_NETPLAY_HARNESS
+#include "netplay_input_driver.h"
+#endif
 #include "generated/ac6recomp_config.h"
 
 REXCVAR_DECLARE(std::string, ac6_graphics_backend);
@@ -54,6 +58,11 @@ class Ac6recompApp : public rex::ReXApp {
     REXLOG_INFO("Ac6recompApp::OnPreSetup");
     rex::ReXApp::OnPreSetup(config);
     LogAc6ConfigPresetSummary();
+#if AC6_NETPLAY_HARNESS
+    // Netplay test harness (scripted input, screenshots). Off unless netplay_input_script or
+    // netplay_screenshot_dir is set.
+    ac6::netplay_input::Install(config);
+#endif
 
     const std::string requested_backend = REXCVAR_GET(ac6_graphics_backend);
 #if REX_HAS_VULKAN
@@ -79,6 +88,9 @@ class Ac6recompApp : public rex::ReXApp {
   void OnPostSetup() override {
     REXLOG_INFO("Ac6recompApp::OnPostSetup");
     rex::ReXApp::OnPostSetup();
+#if AC6_NETPLAY_HARNESS
+    ac6::netplay_input::SetRuntime(runtime());
+#endif
 
     auto* graphics_sys = runtime()->graphics_system();
     if (graphics_sys) {
@@ -87,6 +99,27 @@ class Ac6recompApp : public rex::ReXApp {
         });
         REXLOG_INFO("Ac6recompApp: Native frame boundary callback registered");
     }
+
+    // Native renderer v2 (M2 scaffold). Init is gated on the
+    // ac6_native_renderer cvar (default false): when disabled this is a
+    // no-op and default behavior is completely unchanged.
+    if (ac6::nr2::Init()) {
+      REXLOG_INFO("Ac6recompApp: native renderer v2 active (observe mode)");
+    }
+  }
+
+  void OnShutdown() override {
+    ac6::nr2::Shutdown();
+    // The status dialog must die while the ImGui drawer and window still
+    // exist: ~ImGuiDialog detaches from the drawer, which touches the
+    // window input-listener map and the ImGui context. Leaving it to
+    // ~Ac6recompApp (after ReXApp tears the UI stack down) is a
+    // use-after-free that intermittently SIGSEGVs at exit.
+    native_graphics_status_dialog_.reset();
+#if AC6_NETPLAY_HARNESS
+    ac6::netplay_input::Shutdown();
+#endif
+    rex::ReXApp::OnShutdown();
   }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {

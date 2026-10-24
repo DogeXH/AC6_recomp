@@ -33,10 +33,14 @@ class XEvent : public XObject {
   int32_t Reset();
   void Clear();
 
+  void WaitCallback() override;
+
  protected:
   rex::thread::WaitHandle* GetWaitHandle() override { return event_.get(); }
 
  private:
+  void UpdateGuestSignalState(uint32_t value);
+
   bool manual_reset_ = false;
   std::unique_ptr<rex::thread::Event> event_;
 };

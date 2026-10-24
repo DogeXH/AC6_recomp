@@ -1,0 +1,5 @@
+KCP (MIT) vendored for ac6net streams (vnet lane).
+
+Upstream: https://github.com/skywind3000/kcp
+Tag:      1.7 (commit 38e0c9366e4a72c749ff0bcdf911d1fe9bdfe9f5, 2020-04-24)
+Files:    ikcp.c, ikcp.h, LICENSE (unmodified copies)

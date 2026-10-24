@@ -430,12 +430,16 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
   assert(width);
   assert(height);
 
-  // Modern present pacing (no-op unless enabled): block this guest thread on
-  // GPU delivery of the previous swap plus the target-rate limiter before the
-  // game may submit the next one. See GraphicsSystem::PaceGuestPresent.
-  rex::graphics::GraphicsSystem::PaceGuestPresent();
-
   namespace xenos = rex::graphics::xenos;
+
+  // The caller has already reserved 64 words in the primary ringbuffer. Fill
+  // the entire range with valid one-word Type2 NOP packets up front so every
+  // validation, interception, or pacing-abort return still consumes a valid
+  // command range rather than exposing zeroes as accidental Type0 packets.
+  auto dwords = buffer_ptr.as_array<uint32_t>();
+  for (uint32_t i = 0; i < 64; ++i) {
+    dwords[i] = xenos::MakePacketType2();
+  }
 
   xenos::xe_gpu_texture_fetch_t gpu_fetch;
   memory::copy_and_swap_32_unaligned(&gpu_fetch,
@@ -478,14 +482,6 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
   }
   (void)texture_format_raw;
 
-  // The caller seems to reserve 64 words (256b) in the primary ringbuffer
-  // for this method to do what it needs. We just zero them out and send a
-  // token value. It'd be nice to figure out what this is really doing so
-  // that we could simulate it, though due to TCR I bet all games need to
-  // use this method.
-  buffer_ptr.Zero(64 * 4);
-  auto dwords = buffer_ptr.as_array<uint32_t>();
-
   auto* graphics_system = REX_KERNEL_STATE()->graphics_system();
   if (graphics_system) {
     system::GraphicsSwapSubmission submission;
@@ -504,8 +500,18 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
         gpu_fetch.dword_5,
     };
     if (graphics_system->HandleVideoSwap(submission)) {
+      // Ownership was intercepted before a PM4 swap was committed, so there
+      // must be no pacing reservation unless the intercepting implementation
+      // explicitly supplies its own exactly-once retirement pairing.
       return;
     }
+  }
+
+  // All validation succeeded and HandleVideoSwap declined ownership. Reserve
+  // exactly once immediately before committing the PM4 swap packet; every
+  // backend IssueSwap terminal path retires this reservation exactly once.
+  if (!rex::graphics::GraphicsSystem::PaceGuestPresent()) {
+    return;
   }
 
   uint32_t offset = 0;

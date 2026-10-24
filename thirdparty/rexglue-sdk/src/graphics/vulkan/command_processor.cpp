@@ -11,7 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -20,6 +24,12 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+// Weak: provided by the AC6 app (render_hooks.cpp); absent in standalone
+// tools like the trace replayer, where the stamp is meaningless anyway.
+namespace ac6 {
+__attribute__((weak)) void NotifyWorldCompositorDraw();
+}
 
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
@@ -62,8 +72,18 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_ac6_clear_discard_transfers, false, "GPU/Vulkan",
+                    "Skip only ownership transfers fully overwritten by a proven AC6 clear")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_UINT32(
+    vulkan_max_primary_buffer_ends_without_present, 8, "GPU/Vulkan",
+    "Submit accumulated Vulkan work after this many PM4 primary buffers without a guest "
+    "present while preserving the logical guest frame (0 disables)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
@@ -71,9 +91,261 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_reuse_texture_descriptors, true, "GPU/Vulkan",
+                    "Reuse texture and sampler descriptor sets across draws when the bindings "
+                    "have not changed instead of allocating, writing and rebinding new "
+                    "transient sets for every textured draw")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_UINT32(
+    vulkan_gpu_pass_profile_interval, 0, "GPU/Vulkan",
+    "Trace-harness diagnostic only: write a GPU timestamp after this many guest draw/copy "
+    "commands (copy commands are isolated automatically; 0 disables profiling)");
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_ac6_rect_clear_lowering, false, "GPU/Vulkan",
+    "Replace the exact AC6 solid rectangle clear draw family with Vulkan attachment clears")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_ac6_rect_clear_oracle_telemetry, false, "GPU/Vulkan",
+    "Trace-only: report each coarse AC6 rectangle-clear candidate and its "
+    "fail-closed lowering decision");
+
 namespace rex::graphics::vulkan {
 
 namespace {
+
+class GuestPresentRetirementScope {
+ public:
+  GuestPresentRetirementScope() = default;
+  GuestPresentRetirementScope(const GuestPresentRetirementScope&) = delete;
+  GuestPresentRetirementScope& operator=(
+      const GuestPresentRetirementScope&) = delete;
+  ~GuestPresentRetirementScope() {
+    GraphicsSystem::RetireGuestPresent(delivered_);
+  }
+
+  void MarkDelivered() { delivered_ = true; }
+
+ private:
+  bool delivered_ = false;
+};
+
+enum class Ac6Nr2HotpathPhase : uint32_t {
+  kShaderAnalysis,
+  kSubmissionBegin,
+  kPrimitiveProcess,
+  kShaderModification,
+  kShaderTranslate,
+  kSamplerAcquisition,
+  kTextureRequest,
+  kRenderTargetUpdate,
+  kConfigurePipeline,
+  kNativePrepare,
+  kStateBinding,
+  kUpdateBindings,
+  kMemoryResidency,
+  kDrawRecord,
+  kPostDraw,
+  kCount,
+};
+
+static_assert(
+    size_t(Ac6Nr2HotpathPhase::kCount) ==
+        VulkanCommandProcessor::kAc6Nr2HotpathPhaseCount,
+    "Keep trace per-command phase attribution aligned with hotpath phases");
+
+struct Ac6Nr2HotpathProfileState {
+  uint64_t frame_index = 0;
+  uint64_t draw_count = 0;
+  uint64_t shared_draw_count = 0;
+  uint64_t native_prepare_accepted_count = 0;
+  uint64_t draw_total_ns = 0;
+  std::array<uint64_t, size_t(Ac6Nr2HotpathPhase::kCount)> phase_ns = {};
+};
+
+thread_local Ac6Nr2HotpathProfileState ac6_nr2_hotpath_profile_state;
+
+bool Ac6Nr2HotpathProfileEnabled() {
+  static const bool enabled = [] {
+#if defined(AC6_NR2_TRACE_TOOL)
+    return true;
+#else
+    const char* value = std::getenv("AC6_NR2_HOTPATH_PROFILE");
+    return value && value[0] && std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0;
+#endif
+  }();
+  return enabled;
+}
+
+// Deliberately stricter than the generic profiler switch: only the exact value
+// "1" enables this restart-scoped diagnostic. Keeping the check process-local
+// and cached ensures that a live settings reload can't change the audit window
+// halfway through a frame.
+bool Ac6WorldIdentityTelemetryEnabled() {
+  static const bool enabled = [] {
+    const char* identity =
+        std::getenv("AC6_WORLD_SCALE_IDENTITY_TELEMETRY");
+    const char* transfer_detail =
+        std::getenv("AC6_WORLD_SCALE_TRANSFER_DETAIL");
+    const char* closure_detail =
+        std::getenv("AC6_WORLD_SCALE_CLOSURE_DETAIL");
+    // Transfer detail is a stricter extension of identity telemetry, so its
+    // exact restart gate also enables the aggregate evidence it depends on.
+    // Closure detail shares the same swap-scoped consume/reset operation.
+    return (identity && std::strcmp(identity, "1") == 0) ||
+           (transfer_detail && std::strcmp(transfer_detail, "1") == 0) ||
+           (closure_detail && std::strcmp(closure_detail, "1") == 0);
+  }();
+  return enabled;
+}
+
+bool Ac6WorldScaleTransferDetailEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AC6_WORLD_SCALE_TRANSFER_DETAIL");
+    return value && std::strcmp(value, "1") == 0 &&
+           Ac6WorldIdentityTelemetryEnabled();
+  }();
+  return enabled;
+}
+
+bool Ac6WorldScaleClosureDetailEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AC6_WORLD_SCALE_CLOSURE_DETAIL");
+    return value && std::strcmp(value, "1") == 0 &&
+           Ac6WorldIdentityTelemetryEnabled();
+  }();
+  return enabled;
+}
+
+class Ac6Nr2HotpathDrawTimer {
+ public:
+  explicit Ac6Nr2HotpathDrawTimer(bool enabled) : enabled_(enabled) {
+    if (enabled_) {
+      ++ac6_nr2_hotpath_profile_state.draw_count;
+      start_ = Clock::now();
+    }
+  }
+
+  ~Ac6Nr2HotpathDrawTimer() {
+    if (enabled_) {
+      ac6_nr2_hotpath_profile_state.draw_total_ns += NanosecondsSince(start_);
+    }
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  static uint64_t NanosecondsSince(Clock::time_point start) {
+    return uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+  }
+
+  bool enabled_ = false;
+  Clock::time_point start_ = {};
+};
+
+class Ac6Nr2HotpathPhaseTimer {
+ public:
+  Ac6Nr2HotpathPhaseTimer(bool enabled, Ac6Nr2HotpathPhase phase)
+      : enabled_(enabled), phase_(phase) {
+    if (enabled_) {
+      start_ = Clock::now();
+    }
+  }
+
+  ~Ac6Nr2HotpathPhaseTimer() { Stop(); }
+
+  void Stop() {
+    if (!enabled_) {
+      return;
+    }
+    ac6_nr2_hotpath_profile_state.phase_ns[size_t(phase_)] += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_).count());
+    enabled_ = false;
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  bool enabled_ = false;
+  Ac6Nr2HotpathPhase phase_ = Ac6Nr2HotpathPhase::kShaderAnalysis;
+  Clock::time_point start_ = {};
+};
+
+void Ac6Nr2HotpathProfileEmitAndReset() {
+  if (!Ac6Nr2HotpathProfileEnabled()) {
+    return;
+  }
+
+  Ac6Nr2HotpathProfileState& state = ac6_nr2_hotpath_profile_state;
+  uint64_t accounted_ns = 0;
+  for (uint64_t phase_ns : state.phase_ns) {
+    accounted_ns += phase_ns;
+  }
+  const uint64_t other_ns =
+      state.draw_total_ns > accounted_ns ? state.draw_total_ns - accounted_ns : 0;
+  constexpr double kNanosecondsPerMillisecond = 1000000.0;
+  constexpr double kNanosecondsPerMicrosecond = 1000.0;
+  // This profiler is explicitly opt-in and performance mode enforces
+  // error-only logging, so keep its per-frame diagnostic rows visible.
+  REXGPU_ERROR(
+      "AC6 NR2 Vulkan hotpath schema=2 frame={} draws={} shared={} "
+      "native_accepted={} total_ms={:.3f} avg_us={:.3f} "
+      "shader_analysis_ms={:.3f} submission_begin_ms={:.3f} "
+      "primitive_process_ms={:.3f} shader_modification_ms={:.3f} "
+      "shader_translate_ms={:.3f} "
+      "sampler_acquisition_ms={:.3f} "
+      "texture_request_ms={:.3f} render_target_update_ms={:.3f} "
+      "configure_pipeline_ms={:.3f} native_prepare_ms={:.3f} "
+      "state_binding_ms={:.3f} update_bindings_ms={:.3f} "
+      "memory_residency_ms={:.3f} draw_record_ms={:.3f} post_draw_ms={:.3f} "
+      "other_ms={:.3f}",
+      state.frame_index, state.draw_count, state.shared_draw_count,
+      state.native_prepare_accepted_count,
+      double(state.draw_total_ns) / kNanosecondsPerMillisecond,
+      state.draw_count
+          ? double(state.draw_total_ns) /
+                (double(state.draw_count) * kNanosecondsPerMicrosecond)
+          : 0.0,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kShaderAnalysis)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kSubmissionBegin)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kPrimitiveProcess)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kShaderModification)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kShaderTranslate)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kSamplerAcquisition)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kTextureRequest)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kRenderTargetUpdate)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kConfigurePipeline)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kNativePrepare)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kStateBinding)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kUpdateBindings)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kMemoryResidency)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kDrawRecord)]) /
+          kNanosecondsPerMillisecond,
+      double(state.phase_ns[size_t(Ac6Nr2HotpathPhase::kPostDraw)]) /
+          kNanosecondsPerMillisecond,
+      double(other_ns) / kNanosecondsPerMillisecond);
+
+  const uint64_t next_frame_index = state.frame_index + 1;
+  state = {};
+  state.frame_index = next_frame_index;
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -564,6 +836,65 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/fullscreen_cw_vs.h"
 #include "../shaders/vulkan_spirv/resolve_downscale_cs.h"
 }  // namespace shaders
+
+// Opt-in trace-harness wall timer for one complete IssueDraw invocation. It is
+// armed only after the command has been registered in the matching timestamp
+// bucket, so failed pre-registration setup can't corrupt bucket alignment.
+// No logging or allocation is performed per draw.
+class VulkanCommandProcessor::Ac6GpuPassProfileCpuTimer {
+ public:
+  explicit Ac6GpuPassProfileCpuTimer(VulkanCommandProcessor& command_processor)
+      : command_processor_(command_processor) {
+    enabled_ =
+        command_processor_.ac6_gpu_pass_profile_query_pool_ != VK_NULL_HANDLE;
+    if (enabled_) {
+      start_ = Clock::now();
+    }
+  }
+
+  ~Ac6GpuPassProfileCpuTimer() {
+    if (!armed_) {
+      return;
+    }
+    const uint64_t elapsed_nanoseconds = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+                                                             start_)
+            .count());
+    std::array<uint64_t,
+               VulkanCommandProcessor::kAc6Nr2HotpathPhaseCount>
+        phase_elapsed_nanoseconds = {};
+    const auto& phase_end_nanoseconds =
+        ac6_nr2_hotpath_profile_state.phase_ns;
+    for (size_t phase = 0; phase < phase_elapsed_nanoseconds.size(); ++phase) {
+      phase_elapsed_nanoseconds[phase] =
+          phase_end_nanoseconds[phase] >= phase_start_nanoseconds_[phase]
+              ? phase_end_nanoseconds[phase] - phase_start_nanoseconds_[phase]
+              : 0;
+    }
+    command_processor_.AddAc6GpuPassProfileGuestCommandCpuTime(
+        elapsed_nanoseconds, phase_elapsed_nanoseconds);
+  }
+
+  void Arm() {
+    armed_ = enabled_ &&
+             command_processor_.ac6_gpu_pass_profile_frame_active_ &&
+             command_processor_.ac6_gpu_pass_profile_range_command_count_ != 0;
+    if (armed_) {
+      phase_start_nanoseconds_ = ac6_nr2_hotpath_profile_state.phase_ns;
+    }
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  VulkanCommandProcessor& command_processor_;
+  Clock::time_point start_ = {};
+  std::array<uint64_t,
+             VulkanCommandProcessor::kAc6Nr2HotpathPhaseCount>
+      phase_start_nanoseconds_ = {};
+  bool enabled_ = false;
+  bool armed_ = false;
+};
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -1900,6 +2231,7 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  InitializeAc6GpuPassProfile();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1909,7 +2241,12 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  // Native shared-authority pipelines use this command processor's VkDevice
+  // and pipeline layouts. Destroy them only after all queue work completes,
+  // but before the SDK tears down the layouts and device they reference.
+  ac6::backend::NativeRendererOnVulkanShutdown(GetVulkanDevice()->device());
   InvalidateAllVertexBufferResidency();
+  ShutdownAc6GpuPassProfile();
   ShutdownOcclusionQueryResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -2103,6 +2440,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   frame_completed_ = 0;
   frame_current_ = 1;
   frame_open_ = false;
+  primary_buffer_ends_without_present_ = 0;
 
   for (const auto& semaphore : submissions_in_flight_semaphores_) {
     dfn.vkDestroySemaphore(device, semaphore.second, nullptr);
@@ -2135,6 +2473,15 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  const bool is_fetch_constant =
+      index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5;
+  // Fetch constants are pure state. Rewriting an identical dword does not
+  // require invalidating the fetch constant buffer, texture binding or vertex
+  // buffer residency derived from it.
+  if (is_fetch_constant && register_file_->values[index] == value) {
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2159,8 +2506,7 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
              index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
-  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
-             index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+  } else if (is_fetch_constant) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
     if (texture_cache_) {
@@ -2280,9 +2626,339 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+bool VulkanCommandProcessor::IsAc6WorldIdentityDrawState() const {
+  const RegisterFile& regs = *register_file_;
+  const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto color_info = regs.Get<reg::RB_COLOR_INFO>(
+      reg::RB_COLOR_INFO::rt_register_indices[0]);
+  const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+  return surface_info.value == UINT32_C(0x0A010280) &&
+         color_info.value == 0 &&
+         depth_info.depth_base == 720 &&
+         depth_info.depth_format ==
+             xenos::DepthRenderTargetFormat::kD24FS8;
+}
+
+void VulkanCommandProcessor::RecordAc6WorldIdentityDraw(
+    xenos::EdramMode edram_mode) {
+  if (!Ac6WorldIdentityTelemetryEnabled()) {
+    return;
+  }
+
+  Ac6WorldIdentityDrawTelemetry& telemetry =
+      ac6_world_identity_draw_telemetry_;
+  ++telemetry.draw_commands;
+
+  const RegisterFile& regs = *register_file_;
+  const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto color_info = regs.Get<reg::RB_COLOR_INFO>(
+      reg::RB_COLOR_INFO::rt_register_indices[0]);
+  const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+  const bool surface_semantic_key =
+      surface_info.surface_pitch == 640 &&
+      surface_info.msaa_samples == xenos::MsaaSamples::k2X;
+  const bool surface_key =
+      surface_semantic_key &&
+      surface_info.value == UINT32_C(0x0A010280);
+  const bool color_resource_key =
+      surface_key && color_info.color_base == 0 &&
+      xenos::GetStorageColorFormat(color_info.color_format) ==
+          xenos::ColorRenderTargetFormat::k_8_8_8_8;
+  const bool color_key = color_resource_key && color_info.value == 0;
+  const bool depth_key =
+      surface_key && depth_info.depth_base == 720 &&
+      depth_info.depth_format ==
+          xenos::DepthRenderTargetFormat::kD24FS8;
+  telemetry.surface_key_hits += uint64_t(surface_key);
+  telemetry.surface_semantic_alias_hits +=
+      uint64_t(surface_semantic_key && !surface_key);
+  telemetry.color_key_hits += uint64_t(color_key);
+  telemetry.color_resource_alias_hits +=
+      uint64_t(color_resource_key && !color_key);
+  telemetry.depth_key_hits += uint64_t(depth_key);
+  if (!(color_key && depth_key)) {
+    return;
+  }
+  ++telemetry.candidate_draws;
+
+  const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const auto window_scissor_tl =
+      regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  const auto window_scissor_br =
+      regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  const bool common_partition_state =
+      !window_scissor_tl.window_offset_disable &&
+      window_offset.window_y_offset == 0 &&
+      window_scissor_tl.tl_y == 0 && window_scissor_br.br_y == 720;
+  const bool is_left =
+      common_partition_state && window_offset.window_x_offset == 0 &&
+      window_scissor_tl.tl_x == 0 && window_scissor_br.br_x == 640;
+  const bool is_right =
+      common_partition_state && window_offset.window_x_offset == -640 &&
+      window_scissor_tl.tl_x == 640 &&
+      window_scissor_br.br_x == 1280;
+  telemetry.candidate_left += uint64_t(is_left);
+  telemetry.candidate_right += uint64_t(is_right);
+  telemetry.candidate_partition_unexpected +=
+      uint64_t(!(is_left || is_right));
+
+  draw_util::Scissor local_scissor;
+  draw_util::GetScissor(regs, local_scissor);
+  const auto viewport_transform = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const auto setup_mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const bool viewport_transform_expected =
+      ((edram_mode == xenos::EdramMode::kColorDepth ||
+        edram_mode == xenos::EdramMode::kDepthOnly) &&
+       viewport_transform.value == UINT32_C(0x0000043F)) ||
+      (edram_mode == xenos::EdramMode::kCopy &&
+       viewport_transform.value == UINT32_C(0x00000300));
+  const bool viewport_scissor_expected =
+      (is_left || is_right) && viewport_transform_expected &&
+      setup_mode.vtx_window_offset_enable &&
+      local_scissor.offset[0] == 0 && local_scissor.offset[1] == 0 &&
+      local_scissor.extent[0] == 640 && local_scissor.extent[1] == 720;
+  telemetry.candidate_viewport_scissor_unexpected +=
+      uint64_t(!viewport_scissor_expected);
+
+  bool has_nonzero_extra_color_info = false;
+  for (uint32_t i = 1; i < xenos::kMaxColorRenderTargets; ++i) {
+    has_nonzero_extra_color_info |=
+        regs.Get<reg::RB_COLOR_INFO>(
+                reg::RB_COLOR_INFO::rt_register_indices[i])
+            .value != 0;
+  }
+  telemetry.candidate_mrt_register_state += uint64_t(
+      has_nonzero_extra_color_info ||
+      (regs.Get<reg::RB_COLOR_MASK>().value & UINT32_C(0xFFF0)) != 0);
+
+  auto record_partition = [&](uint64_t& left, uint64_t& right,
+                              uint64_t& unexpected) {
+    if (is_left) {
+      ++left;
+    } else if (is_right) {
+      ++right;
+    } else {
+      ++unexpected;
+    }
+  };
+  switch (edram_mode) {
+    case xenos::EdramMode::kColorDepth:
+      record_partition(telemetry.candidate_mode4_left,
+                       telemetry.candidate_mode4_right,
+                       telemetry.candidate_mode4_unexpected);
+      break;
+    case xenos::EdramMode::kDepthOnly:
+      record_partition(telemetry.candidate_mode5_left,
+                       telemetry.candidate_mode5_right,
+                       telemetry.candidate_mode5_unexpected);
+      break;
+    case xenos::EdramMode::kCopy:
+      record_partition(telemetry.candidate_mode6_left,
+                       telemetry.candidate_mode6_right,
+                       telemetry.candidate_mode6_unexpected);
+      break;
+    default:
+      ++telemetry.candidate_other_mode;
+      break;
+  }
+}
+
+void VulkanCommandProcessor::EmitAndResetAc6WorldIdentityTelemetry(
+    uint32_t frontbuffer_width, uint32_t frontbuffer_height) {
+  if (!Ac6WorldIdentityTelemetryEnabled()) {
+    return;
+  }
+
+  VulkanRenderTargetCache::Ac6WorldIdentityTelemetry rt_telemetry;
+  if (render_target_cache_) {
+    rt_telemetry =
+        render_target_cache_->ConsumeAc6WorldIdentityTelemetry();
+  }
+  const Ac6WorldIdentityDrawTelemetry& draw =
+      ac6_world_identity_draw_telemetry_;
+
+  if (Ac6WorldScaleTransferDetailEnabled()) {
+    // Detail has a standalone schema and is emitted before the stable schema-1
+    // aggregate row so canonical identity parsers remain unchanged.
+    for (uint32_t i = 0; i < rt_telemetry.candidate_transfer_detail_count;
+         ++i) {
+      const VulkanRenderTargetCache::Ac6WorldTransferDetail& detail =
+          rt_telemetry.candidate_transfer_details[i];
+      REXGPU_ERROR(
+          "AC6_WORLD_TRANSFER_DETAIL schema=1 swap={} seq={} call={} slot={} "
+          "start_tiles={} end_tiles={} dest_key={:08x} source_key={:08x} "
+          "host_depth_key={:08x} dest_candidate={} source_candidate={} "
+          "host_depth_candidate={} dest_kind={} source_kind={} host_depth_kind={}",
+          ac6_world_identity_swap_index_, detail.sequence_index,
+          detail.call_index, detail.attachment_slot, detail.start_tiles,
+          detail.end_tiles, detail.dest_key, detail.source_key,
+          detail.host_depth_key, uint32_t(detail.dest_candidate),
+          uint32_t(detail.source_candidate),
+          uint32_t(detail.host_depth_candidate),
+          uint32_t(detail.dest_kind), uint32_t(detail.source_kind),
+          uint32_t(detail.host_depth_kind));
+    }
+    REXGPU_ERROR(
+        "AC6_WORLD_TRANSFER_DETAIL_SUMMARY schema=1 swap={} detail_count={} "
+        "detail_overflow={}",
+        ac6_world_identity_swap_index_,
+        rt_telemetry.candidate_transfer_detail_count,
+        rt_telemetry.candidate_transfer_detail_overflow);
+  }
+
+  if (Ac6WorldScaleClosureDetailEnabled()) {
+    // Unique attachment hyperedges and transfer endpoint tuples are emitted
+    // in deterministic first-seen order. Duplicate observations stay folded
+    // into occurrences, keeping trace logging bounded as well as allocation-
+    // free during the swap.
+    for (uint32_t i = 0;
+         i < rt_telemetry.closure_attachment_detail_count; ++i) {
+      const VulkanRenderTargetCache::Ac6WorldClosureAttachmentDetail& detail =
+          rt_telemetry.closure_attachment_details[i];
+      REXGPU_ERROR(
+          "AC6_WORLD_CLOSURE_ATTACHMENT schema=1 swap={} seq={} update={} "
+          "occurrences={} used_mask={} key0={:08x} key1={:08x} "
+          "key2={:08x} key3={:08x} key4={:08x}",
+          ac6_world_identity_swap_index_, detail.sequence_index,
+          detail.first_update_index, detail.occurrences, detail.used_mask,
+          detail.keys[0], detail.keys[1], detail.keys[2], detail.keys[3],
+          detail.keys[4]);
+    }
+    for (uint32_t i = 0; i < rt_telemetry.closure_transfer_detail_count;
+         ++i) {
+      const VulkanRenderTargetCache::Ac6WorldClosureTransferDetail& detail =
+          rt_telemetry.closure_transfer_details[i];
+      REXGPU_ERROR(
+          "AC6_WORLD_CLOSURE_TRANSFER schema=1 swap={} seq={} call={} "
+          "occurrences={} slot={} endpoint_mask={} dest_key={:08x} "
+          "source_key={:08x} host_depth_key={:08x}",
+          ac6_world_identity_swap_index_, detail.sequence_index,
+          detail.first_call_index, detail.occurrences,
+          detail.attachment_slot, detail.endpoint_mask, detail.dest_key,
+          detail.source_key, detail.host_depth_key);
+    }
+    REXGPU_ERROR(
+        "AC6_WORLD_CLOSURE_SUMMARY schema=1 swap={} attachment_updates={} "
+        "attachment_observations={} attachment_unique={} "
+        "attachment_overflow={} transfer_calls={} transfer_observations={} "
+        "transfer_unique={} transfer_overflow={}",
+        ac6_world_identity_swap_index_,
+        rt_telemetry.closure_attachment_next_update_index,
+        rt_telemetry.closure_attachment_observations,
+        rt_telemetry.closure_attachment_detail_count,
+        rt_telemetry.closure_attachment_overflow,
+        rt_telemetry.closure_transfer_next_call_index,
+        rt_telemetry.closure_transfer_observations,
+        rt_telemetry.closure_transfer_detail_count,
+        rt_telemetry.closure_transfer_overflow);
+  }
+
+  // One deterministic aggregate row per committed guest swap. Avoid handles,
+  // addresses, wall clocks, and floating-point values so rows can be diffed
+  // directly across identity runs.
+  std::string row = fmt::format(
+      "AC6_WORLD_IDENTITY schema=1 swap={} frontbuffer={}x{} "
+      "color_key=0:8:2:0 depth_key=720:8:2:1 draws={} "
+      "surface_key={} surface_semantic_alias={} color_key_hits={} "
+      "color_resource_alias={} "
+      "depth_key_hits={} candidates={}",
+      ac6_world_identity_swap_index_, frontbuffer_width, frontbuffer_height,
+      draw.draw_commands, draw.surface_key_hits,
+      draw.surface_semantic_alias_hits, draw.color_key_hits,
+      draw.color_resource_alias_hits, draw.depth_key_hits, draw.candidate_draws);
+  fmt::format_to(
+      std::back_inserter(row),
+      " left={} right={} partition_unexpected={} viewport_scissor_unexpected={} "
+      "mrt_register_state={} active_mrt={} mode4_left={} mode4_right={} "
+      "mode4_unexpected={} mode5_left={} mode5_right={} mode5_unexpected={} "
+      "mode6_left={} mode6_right={} mode6_unexpected={} other_mode={}",
+      draw.candidate_left, draw.candidate_right,
+      draw.candidate_partition_unexpected,
+      draw.candidate_viewport_scissor_unexpected,
+      draw.candidate_mrt_register_state, draw.candidate_active_mrt,
+      draw.candidate_mode4_left, draw.candidate_mode4_right,
+      draw.candidate_mode4_unexpected, draw.candidate_mode5_left,
+      draw.candidate_mode5_right, draw.candidate_mode5_unexpected,
+      draw.candidate_mode6_left, draw.candidate_mode6_right,
+      draw.candidate_mode6_unexpected, draw.candidate_other_mode);
+  fmt::format_to(
+      std::back_inserter(row),
+      " attachment_sets={} attachment_color_depth={} attachment_missing_pair={} "
+      "attachment_mixed={} attachment_nonworld={} "
+      "attachment_surface_alias={} attachment_color_alias={} transfer_calls={} "
+      "transfer_calls_mixed={} transfer_invocations={} "
+      "transfer_tiles={} "
+      "transfer_dest={} transfer_source={} transfer_host_depth_source={} "
+      "transfer_cross_family={} transfer_cross_kind={} "
+      "transfer_source_self_copy={}",
+      rt_telemetry.candidate_attachment_sets,
+      rt_telemetry.candidate_attachment_sets_color_depth,
+      rt_telemetry.candidate_attachment_sets_missing_pair,
+      rt_telemetry.candidate_attachment_sets_mixed,
+      rt_telemetry.candidate_attachment_nonworld_targets,
+      rt_telemetry.candidate_attachment_surface_aliases,
+      rt_telemetry.candidate_attachment_color_aliases,
+      rt_telemetry.candidate_transfer_calls,
+      rt_telemetry.candidate_transfer_calls_mixed,
+      rt_telemetry.candidate_transfer_invocations,
+      rt_telemetry.candidate_transfer_range_tiles,
+      rt_telemetry.candidate_transfer_dest,
+      rt_telemetry.candidate_transfer_source,
+      rt_telemetry.candidate_transfer_host_depth_source,
+      rt_telemetry.candidate_transfer_cross_family,
+      rt_telemetry.candidate_transfer_cross_kind,
+      rt_telemetry.candidate_transfer_source_self_copy);
+  fmt::format_to(
+      std::back_inserter(row),
+      " host_depth_texture={} host_depth_scratch={} host_depth_self_store={} "
+      "host_depth_store_dispatches={} attachment_clear_targets={} "
+      "resolve_commands={} resolve_surface_alias={} resolve_color_alias={} "
+      "resolve_copies={} "
+      "resolve_color_clears={} resolve_depth_clears={} resolve_empty={} "
+      "resolve_span_oob={} direct_attempts={} direct_successes={} "
+      "direct_fallbacks={} dump_calls={} dump_rectangles={} "
+      "dump_expected_owner={} dump_cross_kind_owner={} "
+      "dump_nonworld_owner={} standard_resolve_dispatches={}",
+      rt_telemetry.candidate_host_depth_texture_reads,
+      rt_telemetry.candidate_host_depth_scratch_reads,
+      rt_telemetry.candidate_host_depth_self_stores,
+      rt_telemetry.candidate_host_depth_store_dispatches,
+      rt_telemetry.candidate_attachment_clear_targets,
+      rt_telemetry.candidate_resolve_commands,
+      rt_telemetry.candidate_resolve_surface_aliases,
+      rt_telemetry.candidate_resolve_color_aliases,
+      rt_telemetry.candidate_resolve_copies,
+      rt_telemetry.candidate_resolve_color_clears,
+      rt_telemetry.candidate_resolve_depth_clears,
+      rt_telemetry.candidate_resolve_empty_rectangles,
+      rt_telemetry.candidate_resolve_span_oob,
+      rt_telemetry.candidate_direct_resolve_attempts,
+      rt_telemetry.candidate_direct_resolve_successes,
+      rt_telemetry.candidate_direct_resolve_fallbacks,
+      rt_telemetry.candidate_dump_calls,
+      rt_telemetry.candidate_dump_rectangles,
+      rt_telemetry.candidate_dump_expected_owner_rectangles,
+      rt_telemetry.candidate_dump_cross_kind_owner_rectangles,
+      rt_telemetry.candidate_dump_nonworld_owner_rectangles,
+      rt_telemetry.candidate_standard_resolve_dispatches);
+  // Performance mode suppresses lower log severities. This diagnostic is
+  // explicitly opt-in, so keep its single per-swap row visible there.
+  REXGPU_ERROR("{}", row);
+
+  ac6_world_identity_draw_telemetry_ = {};
+  ++ac6_world_identity_swap_index_;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  // A committed PM4 swap has exactly one terminal retirement regardless of
+  // presenter absence, submission failure, an intentional drop, a refresh
+  // callback failure, or the normal delivered path.
+  GuestPresentRetirementScope guest_present_retirement;
   SCOPE_profile_cpu_f("gpu");
+  Ac6Nr2HotpathProfileEmitAndReset();
+  EmitAndResetAc6WorldIdentityTelemetry(frontbuffer_width,
+                                        frontbuffer_height);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2297,6 +2973,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
+
+  ac6::backend::NativeRendererOnGpuSwap();
 
   // Keep the AC6 frame-boundary diagnostics in sync with the D3D12 path before
   // the swap source is selected and presented.
@@ -2336,6 +3014,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+    EndSubmission(true);
     return;
   }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
@@ -2450,7 +3129,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  bool refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
@@ -2965,6 +3644,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+
+  if (refreshed) {
+    guest_present_retirement.MarkDelivered();
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -3618,8 +4301,41 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 }
 
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
-  if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
-      CanEndSubmissionImmediately()) {
+  if (!submission_open_) {
+    return;
+  }
+
+  bool submit_long_unpresented_frame = false;
+  if (frame_open_) {
+    ++primary_buffer_ends_without_present_;
+    uint32_t limit = REXCVAR_GET(vulkan_max_primary_buffer_ends_without_present);
+    submit_long_unpresented_frame = limit && primary_buffer_ends_without_present_ >= limit;
+  }
+
+  // Submit accumulated work if AC6 runs a long stream without presenting.
+  // This does not close or advance the logical guest frame, which keeps the
+  // world/camera setup joined to its later resolve and presentation passes.
+  //
+  // Respect the same safety gate as ordinary primary-buffer submissions.
+  // In particular, ending a submission while asynchronous pipeline creation
+  // is still in progress may submit placeholder/incomplete world draws. Keep
+  // the counter above the threshold and retry at the next primary-buffer end
+  // instead of discarding the pending watchdog request.
+  bool can_end_submission = CanEndSubmissionImmediately();
+  if (submit_long_unpresented_frame && can_end_submission) {
+    static uint64_t forced_mid_frame_submit_count = 0;
+    ++forced_mid_frame_submit_count;
+    if (forced_mid_frame_submit_count == 1 ||
+        !(forced_mid_frame_submit_count & (forced_mid_frame_submit_count - 1))) {
+      REXGPU_WARN(
+          "Submitting accumulated Vulkan work for guest frame {} after {} PM4 primary "
+          "buffers without advancing the logical frame (occurrence {})",
+          frame_current_, primary_buffer_ends_without_present_, forced_mid_frame_submit_count);
+    }
+    if (EndSubmission(false)) {
+      primary_buffer_ends_without_present_ = 0;
+    }
+  } else if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && can_end_submission) {
     EndSubmission(false);
   }
 }
@@ -3632,6 +4348,7 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
+  Ac6GpuPassProfileCpuTimer ac6_gpu_pass_profile_cpu_timer(*this);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3653,10 +4370,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   };
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  RecordAc6WorldIdentityDraw(edram_mode);
+  if (ac6_gpu_pass_profile_query_pool_ != VK_NULL_HANDLE) {
+    // The profiler needs a command-buffer position before every guest command,
+    // including commands that later prove to be no-ops. This is opt-in only;
+    // the normal renderer keeps its existing lazy BeginSubmission behavior.
+    if (!BeginSubmission(true)) {
+      return draw_fail("gpu_pass_profile_begin_submission");
+    }
+    BeginAc6GpuPassProfileGuestCommand(
+        edram_mode == xenos::EdramMode::kCopy);
+    ac6_gpu_pass_profile_cpu_timer.Arm();
+  }
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
     return IssueCopy();
   }
+
+  const bool ac6_nr2_hotpath_profile = Ac6Nr2HotpathProfileEnabled();
+  Ac6Nr2HotpathDrawTimer ac6_nr2_hotpath_draw_timer(ac6_nr2_hotpath_profile);
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_shader_analysis_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kShaderAnalysis);
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -3711,6 +4445,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return true;
     }
   }
+  // AC6: the world/effects compositor draws once per frame whenever the 3D
+  // world renders (never in the 2D front-end) - stamp it as the "gameplay
+  // world active" signal for the dynamic FPS pacing. Ported from the D3D12
+  // backend: without this the Vulkan build's world detection failed closed
+  // and the FPS unlock/dt-snap machinery never engaged in missions.
+  if (pixel_shader && pixel_shader->ucode_data_hash() == UINT64_C(0x17e5e4ac3e713245) &&
+      &ac6::NotifyWorldCompositorDraw != nullptr) {
+    ac6::NotifyWorldCompositorDraw();
+  }
+
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
@@ -3737,6 +4481,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  ac6_nr2_hotpath_shader_analysis_timer.Stop();
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -3745,12 +4490,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // before the awaiting may be referencing objects destroyed by
   // CompletedSubmissionUpdated.
   for (uint32_t i = 0; i < 2; ++i) {
-    if (!BeginSubmission(true)) {
+    Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_submission_begin_timer(
+        ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kSubmissionBegin);
+    const bool submission_began = BeginSubmission(true);
+    ac6_nr2_hotpath_submission_begin_timer.Stop();
+    if (!submission_began) {
       return draw_fail("begin_submission");
     }
 
     // Process primitives.
-    if (!primitive_processor_->Process(primitive_processing_result)) {
+    Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_primitive_process_timer(
+        ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kPrimitiveProcess);
+    const bool primitives_processed =
+        primitive_processor_->Process(primitive_processing_result);
+    ac6_nr2_hotpath_primitive_process_timer.Stop();
+    if (!primitives_processed) {
       return draw_fail("primitive_processing");
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -3780,6 +4534,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
 
     // Shader modifications.
+    Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_shader_modification_timer(
+        ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kShaderModification);
     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
         ps_param_gen_pos != UINT32_MAX);
@@ -3787,8 +4543,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                    *pixel_shader, interpolator_mask,
                                                    ps_param_gen_pos, normalized_depth_control)
                                              : SpirvShaderTranslator::Modification(0);
+    ac6_nr2_hotpath_shader_modification_timer.Stop();
 
     // Translate the shaders now to obtain the sampler bindings.
+    Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_shader_translate_timer(
+        ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kShaderTranslate);
     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
         vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
     pixel_shader_translation =
@@ -3799,6 +4558,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                   pixel_shader_translation)) {
       return draw_fail("shader_translation");
     }
+    ac6_nr2_hotpath_shader_translate_timer.Stop();
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
     // modification, so if on the second iteration of this loop it becomes
@@ -3807,6 +4567,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // vertex shader types), the bindings will stay the same.
     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
     // submission.
+    Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_sampler_timer(
+        ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kSamplerAcquisition);
     uint32_t samplers_overflowed_count = 0;
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
@@ -3870,6 +4632,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  if (Ac6WorldIdentityTelemetryEnabled() &&
+      IsAc6WorldIdentityDrawState() &&
+      (normalized_color_mask & UINT32_C(0xFFF0))) {
+    ++ac6_world_identity_draw_telemetry_.candidate_active_mrt;
+  }
 
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
@@ -3877,39 +4644,565 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
-  texture_cache_->RequestTextures(used_texture_mask);
+  const bool native_shared_authority =
+      ac6::backend::NativeRendererSharedAuthorityEnabled();
+  constexpr uint64_t kAc6ClearVertexShaderHash =
+      UINT64_C(0x0a6d1dd7767fdf27);
+  constexpr uint64_t kAc6ClearPixelShaderHash =
+      UINT64_C(0x2e372ea28cc404b7);
+  const VulkanShader* const ac6_rect_clear_active_pixel =
+      static_cast<VulkanShader*>(active_pixel_shader());
+  const auto ac6_rect_clear_edram_mode =
+      regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  const bool ac6_rect_clear_oracle_candidate =
+      REXCVAR_GET(vulkan_ac6_rect_clear_oracle_telemetry) &&
+      native_shared_authority && REXCVAR_GET(vulkan_ac6_rect_clear_lowering) &&
+      is_rasterization_done &&
+      prim_type == xenos::PrimitiveType::kRectangleList && index_count == 3 &&
+      vertex_shader->ucode_data_hash() == kAc6ClearVertexShaderHash &&
+      ac6_rect_clear_active_pixel &&
+      ac6_rect_clear_active_pixel->ucode_data_hash() ==
+          kAc6ClearPixelShaderHash &&
+      (ac6_rect_clear_edram_mode == xenos::EdramMode::kColorDepth ||
+       ac6_rect_clear_edram_mode == xenos::EdramMode::kDepthOnly);
 
-  const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+  // AC6 emits its clears as a three-vertex rectangle using one tiny, fixed
+  // vertex shader.  In the shared-authority path this is needlessly expensive
+  // on the Deck: the large depth rectangles alone consume roughly 2 ms of the
+  // preserved Gracemeria frame.  Decode only the exact, observed shader/state
+  // family, and leave every other draw on the normal pipeline path.
+  struct Ac6RectClearPlan {
+    bool valid = false;
+    bool clear_color = false;
+    bool clear_depth = false;
+    bool clear_stencil = false;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkClearColorValue color = {};
+    float depth = 0.0f;
+    uint32_t stencil = 0;
+  };
+  auto build_ac6_rect_clear_plan = [&]() -> Ac6RectClearPlan {
+    Ac6RectClearPlan plan;
+
+    // Rectangle lists are deliberately classified as non-polygonal by the SDK
+    // (changing that globally affects culling in other titles). Require that
+    // exact classification here so a future backend change fails closed.
+    if (!native_shared_authority ||
+        !REXCVAR_GET(vulkan_ac6_rect_clear_lowering) ||
+        render_target_cache_->GetPath() !=
+            RenderTargetCache::Path::kHostRenderTargets ||
+        primitive_polygonal || !is_rasterization_done ||
+        prim_type != xenos::PrimitiveType::kRectangleList || index_count != 3 ||
+        index_buffer_info != nullptr || major_mode_explicit ||
+        vertex_shader->ucode_data_hash() != kAc6ClearVertexShaderHash ||
+        vertex_shader->memexport_eM_written() || memexport_writes_possible ||
+        used_texture_mask || active_occlusion_query_.valid) {
+      return plan;
+    }
+
+    const auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const auto rb_modecontrol = regs.Get<reg::RB_MODECONTROL>();
+    if (vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex ||
+        vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+        vgt_draw_initiator.num_indices != 3 ||
+        primitive_processing_result.guest_primitive_type !=
+            xenos::PrimitiveType::kRectangleList ||
+        primitive_processing_result.host_primitive_type !=
+            xenos::PrimitiveType::kRectangleList ||
+        primitive_processing_result.host_vertex_shader_type !=
+            Shader::HostVertexShaderType::kVertex ||
+        primitive_processing_result.guest_draw_vertex_count != 3 ||
+        primitive_processing_result.host_draw_vertex_count != 3 ||
+        primitive_processing_result.line_loop_closing_index != 0 ||
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+        primitive_processing_result.guest_index_base != 0 ||
+        primitive_processing_result.host_index_format !=
+            xenos::IndexFormat::kInt16 ||
+        primitive_processing_result.host_shader_index_endian !=
+            xenos::Endian::kNone ||
+        primitive_processing_result.host_primitive_reset_enabled ||
+        primitive_processing_result.host_index_buffer_handle != SIZE_MAX ||
+        regs.Get<reg::VGT_INDX_OFFSET>().value != 0 ||
+        regs.Get<reg::VGT_MIN_VTX_INDX>().value != 0 ||
+        regs.Get<reg::VGT_MAX_VTX_INDX>().value != UINT32_C(0x0000ffff) ||
+        rb_surface_info.msaa_samples != xenos::MsaaSamples::k4X ||
+        rb_surface_info.surface_pitch == 0 ||
+        (regs[XE_GPU_REG_PA_SC_AA_CONFIG] != 0 &&
+         regs[XE_GPU_REG_PA_SC_AA_CONFIG] != UINT32_C(0x0000c003)) ||
+        regs[XE_GPU_REG_PA_SC_AA_MASK] != UINT32_C(0x0000ffff) ||
+        regs.Get<reg::PA_SC_MPASS_PS_CNTL>().value != 0 ||
+        regs.Get<reg::PA_CL_VTE_CNTL>().value != UINT32_C(0x00000300) ||
+        regs.Get<reg::PA_SU_SC_MODE_CNTL>().value != UINT32_C(0x00010000) ||
+        regs.Get<reg::PA_SU_VTX_CNTL>().value != UINT32_C(0x00000005) ||
+        regs.Get<reg::PA_CL_CLIP_CNTL>().value != UINT32_C(0x00010000) ||
+        regs.Get<reg::PA_SC_VIZ_QUERY>().value != 0 ||
+        regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>().value != 0 ||
+        regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>().value !=
+            UINT32_C(0x20002000) ||
+        regs.Get<reg::PA_SC_WINDOW_OFFSET>().value != 0 ||
+        regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>().value != 0 ||
+        regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().value !=
+            UINT32_C(0x20002000)) {
+      return plan;
+    }
+
+    const bool depth_only =
+        rb_modecontrol.edram_mode == xenos::EdramMode::kDepthOnly;
+    const bool color_depth =
+        rb_modecontrol.edram_mode == xenos::EdramMode::kColorDepth;
+    if ((!depth_only && !color_depth) ||
+        rb_modecontrol.value != uint32_t(rb_modecontrol.edram_mode)) {
+      return plan;
+    }
+    VulkanShader *const active_pixel =
+        static_cast<VulkanShader *>(active_pixel_shader());
+    if (!active_pixel ||
+        active_pixel->ucode_data_hash() != kAc6ClearPixelShaderHash) {
+      return plan;
+    }
+
+    if (depth_only) {
+      const uint32_t raw_color_mask =
+          regs.Get<reg::RB_COLOR_MASK>().value;
+      if (pixel_shader != nullptr || normalized_color_mask != 0 ||
+          normalized_depth_control.value != UINT32_C(0x00008777) ||
+          regs.Get<reg::RB_DEPTHCONTROL>().value != UINT32_C(0x00008777) ||
+          (regs.Get<reg::RB_COLORCONTROL>().value != 0 &&
+           regs.Get<reg::RB_COLORCONTROL>().value != UINT32_C(0x87000004)) ||
+          (raw_color_mask != UINT32_C(0x0000ffff) &&
+           raw_color_mask != UINT32_C(0x0000000f))) {
+        return plan;
+      }
+    } else {
+      if (!pixel_shader ||
+          pixel_shader->ucode_data_hash() != kAc6ClearPixelShaderHash ||
+          pixel_shader->writes_color_targets() != 1 ||
+          pixel_shader->kills_pixels() || pixel_shader->writes_depth() ||
+          pixel_shader->memexport_eM_written() ||
+          normalized_color_mask != UINT32_C(0x0000000f) ||
+          regs.Get<reg::RB_COLOR_MASK>().value != UINT32_C(0x0000ffff) ||
+          regs.Get<reg::RB_COLORCONTROL>().value != 0 ||
+          regs.Get<reg::RB_BLENDCONTROL>().value != UINT32_C(0x00010001) ||
+          regs.Get<reg::RB_COLOR_INFO>().value != 0 ||
+          (normalized_depth_control.value != 0 &&
+           normalized_depth_control.value != UINT32_C(0x00008777)) ||
+          regs.Get<reg::RB_DEPTHCONTROL>().value !=
+              normalized_depth_control.value) {
+        return plan;
+      }
+      plan.clear_color = true;
+    }
+
+    if (normalized_depth_control.value == UINT32_C(0x00008777)) {
+      const auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
+      if (!normalized_depth_control.z_enable ||
+          !normalized_depth_control.z_write_enable ||
+          normalized_depth_control.zfunc != xenos::CompareFunction::kAlways ||
+          !normalized_depth_control.stencil_enable ||
+          normalized_depth_control.stencilfunc !=
+              xenos::CompareFunction::kAlways ||
+          normalized_depth_control.stencilfail != xenos::StencilOp::kKeep ||
+          normalized_depth_control.stencilzfail != xenos::StencilOp::kKeep ||
+          normalized_depth_control.stencilzpass != xenos::StencilOp::kReplace ||
+          normalized_depth_control.backface_enable ||
+          (stencil_ref_mask.stencilref != 0 &&
+           stencil_ref_mask.stencilref != UINT32_C(0xff)) ||
+          stencil_ref_mask.stencilmask != 0 ||
+          stencil_ref_mask.stencilwritemask != UINT32_C(0xff) ||
+          stencil_ref_mask._pad_24 != 0) {
+        return Ac6RectClearPlan{};
+      }
+      plan.clear_depth = true;
+      plan.clear_stencil = true;
+      plan.stencil = stencil_ref_mask.stencilref;
+    }
+
+    const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+    constexpr uint32_t kVertexDwords = 7;
+    constexpr uint32_t kVertexCount = 3;
+    constexpr uint32_t kVertexBytes =
+        kVertexDwords * kVertexCount * sizeof(uint32_t);
+    const uint64_t vertex_address_64 = uint64_t(fetch.address) << 2;
+    if (fetch.type != xenos::FetchConstantType::kVertex ||
+        fetch.endian != xenos::Endian::k8in32 ||
+        fetch.size != kVertexDwords * kVertexCount ||
+        vertex_address_64 > SharedMemory::kBufferSize - kVertexBytes) {
+      return Ac6RectClearPlan{};
+    }
+    const uint32_t vertex_address = uint32_t(vertex_address_64);
+    // CPU memory doesn't contain GPU/memexport writes until a readback.  Never
+    // lower such a draw from stale bytes; the normal shader path reads the
+    // authoritative shared GPU buffer.
+    if (shared_memory_->IsAnyPageGpuWritten(vertex_address, kVertexBytes) ||
+        !shared_memory_->RequestRange(vertex_address, kVertexBytes)) {
+      return Ac6RectClearPlan{};
+    }
+    const uint32_t *const guest_words = reinterpret_cast<const uint32_t *>(
+        memory_->physical_membase() + vertex_address);
+    uint32_t decoded_bits[kVertexCount][kVertexDwords];
+    float decoded[kVertexCount][kVertexDwords];
+    for (uint32_t vertex = 0; vertex < kVertexCount; ++vertex) {
+      for (uint32_t component = 0; component < kVertexDwords; ++component) {
+        uint32_t bits = xenos::GpuSwap(
+            guest_words[vertex * kVertexDwords + component], fetch.endian);
+        decoded_bits[vertex][component] = bits;
+        std::memcpy(&decoded[vertex][component], &bits, sizeof(bits));
+        if (!std::isfinite(decoded[vertex][component])) {
+          return Ac6RectClearPlan{};
+        }
+      }
+    }
+
+    // The fixed shader loads position.xyz and one RGBA interpolator from each
+    // 7-dword vertex.  Accept only an axis-aligned TL, TR, BR rectangle with a
+    // bit-identical Z and solid color, so interpolation, clipping, alpha and
+    // edge coverage cannot change the result.
+    if (decoded[0][1] != decoded[1][1] || decoded[1][0] != decoded[2][0] ||
+        decoded_bits[0][2] != decoded_bits[1][2] ||
+        decoded_bits[1][2] != decoded_bits[2][2]) {
+      return Ac6RectClearPlan{};
+    }
+    for (uint32_t component = 3; component < kVertexDwords; ++component) {
+      if (decoded_bits[0][component] != decoded_bits[1][component] ||
+          decoded_bits[1][component] != decoded_bits[2][component]) {
+        return Ac6RectClearPlan{};
+      }
+    }
+    const float x0 = decoded[0][0];
+    const float y0 = decoded[0][1];
+    const float x1 = decoded[1][0];
+    const float y1 = decoded[2][1];
+    if (x0 < 0.0f || y0 < 0.0f || x1 <= x0 || y1 <= y0 ||
+        x1 > float(xenos::kTexture2DCubeMaxWidthHeight) ||
+        y1 > float(xenos::kTexture2DCubeMaxWidthHeight) ||
+        x1 > float(rb_surface_info.surface_pitch) || std::floor(x0) != x0 ||
+        std::floor(y0) != y0 || std::floor(x1) != x1 || std::floor(y1) != y1) {
+      return Ac6RectClearPlan{};
+    }
+    plan.x = uint32_t(x0);
+    plan.y = uint32_t(y0);
+    plan.width = uint32_t(x1 - x0);
+    plan.height = uint32_t(y1 - y0);
+
+    if (plan.clear_color) {
+      for (uint32_t component = 0; component < 4; ++component) {
+        plan.color.float32[component] = decoded[0][3 + component];
+      }
+    }
+    if (plan.clear_depth) {
+      const float guest_depth = decoded[0][2];
+      const auto depth_format = regs.Get<reg::RB_DEPTH_INFO>().depth_format;
+      if (depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+        // Shipped AC6 settings store the full [0, 2) float24 range in the host
+        // [0, 1) range.  The fixed viewport maps Z by 0.5, and depth clamp
+        // confines it to [0, 0.5].
+        if (render_target_cache_->depth_float24_convert_in_pixel_shader()) {
+          return Ac6RectClearPlan{};
+        }
+        plan.depth = rex::clamp_float(guest_depth, 0.0f, 1.0f) * 0.5f;
+      } else if (depth_format == xenos::DepthRenderTargetFormat::kD24S8) {
+        plan.depth = rex::clamp_float(guest_depth, 0.0f, 1.0f);
+      } else {
+        return Ac6RectClearPlan{};
+      }
+    }
+    plan.valid = plan.clear_color || plan.clear_depth || plan.clear_stencil;
+    return plan;
+  };
+  Ac6RectClearPlan ac6_rect_clear_plan = build_ac6_rect_clear_plan();
+  if (ac6_rect_clear_oracle_candidate && !ac6_rect_clear_plan.valid) {
+    const auto oracle_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const char* const reject_reason =
+        oracle_surface_info.msaa_samples != xenos::MsaaSamples::k4X
+            ? "msaa"
+            : "pre_rtc";
+    std::fprintf(
+        stderr,
+        "AC6_RECT_CLEAR_ORACLE decision=reject stage=pre_rtc mode=%u "
+        "reason=%s processed_guest=%u processed_host=%u host_vs_type=%u "
+        "guest_count=%u host_count=%u msaa=%u\n",
+        uint32_t(ac6_rect_clear_edram_mode), reject_reason,
+        uint32_t(primitive_processing_result.guest_primitive_type),
+        uint32_t(primitive_processing_result.host_primitive_type),
+        uint32_t(primitive_processing_result.host_vertex_shader_type),
+        primitive_processing_result.guest_draw_vertex_count,
+        primitive_processing_result.host_draw_vertex_count,
+        uint32_t(oracle_surface_info.msaa_samples));
+    std::fflush(stderr);
+  }
+
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_texture_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kTextureRequest);
+  texture_cache_->RequestTextures(used_texture_mask);
+  ac6_nr2_hotpath_texture_timer.Stop();
+
+  const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider = nullptr;
   // Set up the render targets - this may perform dispatches and draws.
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_render_target_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kRenderTargetUpdate);
+  VulkanRenderTargetCache::Ac6ClearOverwrite clear_overwrite = {};
+  const bool discard_clear_transfers = ac6_rect_clear_plan.valid &&
+      REXCVAR_GET(vulkan_ac6_clear_discard_transfers);
+  if (discard_clear_transfers) {
+    clear_overwrite = {ac6_rect_clear_plan.x, ac6_rect_clear_plan.y,
+        ac6_rect_clear_plan.width, ac6_rect_clear_plan.height,
+        ac6_rect_clear_plan.clear_color, ac6_rect_clear_plan.clear_depth,
+        ac6_rect_clear_plan.clear_stencil};
+  }
+  if (!render_target_cache_->UpdateWithAc6ClearOverwrite(
+          is_rasterization_done, normalized_depth_control,
+          normalized_color_mask, *vertex_shader,
+          discard_clear_transfers ? &clear_overwrite : nullptr)) {
     return draw_fail("render_target_update");
   }
+  ac6_nr2_hotpath_render_target_timer.Stop();
 
-  // Create the pipeline (for this, need the render pass from the render target
-  // cache), translating the shaders - doing this now to obtain the used
-  // textures.
-  VkPipeline pipeline;
+  if (ac6_rect_clear_plan.valid) {
+    const auto render_pass_key =
+        render_target_cache_->last_update_render_pass_key();
+    uint32_t expected_attachments = 0;
+    if (ac6_rect_clear_plan.clear_depth || ac6_rect_clear_plan.clear_stencil) {
+      expected_attachments |= 1u;
+    }
+    if (ac6_rect_clear_plan.clear_color) {
+      expected_attachments |= 2u;
+    }
+    const auto *framebuffer = render_target_cache_->last_update_framebuffer();
+    const uint32_t scale_x = render_target_cache_->draw_resolution_scale_x();
+    const uint32_t scale_y = render_target_cache_->draw_resolution_scale_y();
+    const uint64_t clear_x = uint64_t(ac6_rect_clear_plan.x) * scale_x;
+    const uint64_t clear_y = uint64_t(ac6_rect_clear_plan.y) * scale_y;
+    const uint64_t clear_width = uint64_t(ac6_rect_clear_plan.width) * scale_x;
+    const uint64_t clear_height =
+        uint64_t(ac6_rect_clear_plan.height) * scale_y;
+    // Mode 5 has no effective pixel shader or color writes. The ordinary draw
+    // may nevertheless keep RT0 bound alongside depth; clearing only the
+    // depth/stencil aspects must leave that unused color attachment untouched.
+    const bool attachment_usage_matches =
+        render_pass_key.depth_and_color_used == expected_attachments ||
+        (!ac6_rect_clear_plan.clear_color && ac6_rect_clear_plan.clear_depth &&
+         ac6_rect_clear_plan.clear_stencil && expected_attachments == 1u &&
+         render_pass_key.depth_and_color_used == 3u);
+    bool attachments_match =
+        framebuffer && scale_x != 0 && scale_y != 0 &&
+        attachment_usage_matches &&
+        render_pass_key.msaa_samples == xenos::MsaaSamples::k4X &&
+        !render_pass_key.color_rts_use_transfer_formats &&
+        (!ac6_rect_clear_plan.clear_color ||
+         render_pass_key.color_0_view_format ==
+             xenos::ColorRenderTargetFormat::k_8_8_8_8) &&
+        (!ac6_rect_clear_plan.clear_depth ||
+         render_pass_key.depth_format ==
+             regs.Get<reg::RB_DEPTH_INFO>().depth_format) &&
+        clear_x + clear_width <= framebuffer->host_extent.width &&
+        clear_y + clear_height <= framebuffer->host_extent.height;
+    if (attachments_match) {
+      SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+          render_target_cache_->last_update_render_pass(), framebuffer);
+      VkClearAttachment attachments[2] = {};
+      uint32_t attachment_count = 0;
+      if (ac6_rect_clear_plan.clear_color) {
+        VkClearAttachment &color_attachment = attachments[attachment_count++];
+        color_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        color_attachment.colorAttachment = 0;
+        color_attachment.clearValue.color = ac6_rect_clear_plan.color;
+      }
+      if (ac6_rect_clear_plan.clear_depth ||
+          ac6_rect_clear_plan.clear_stencil) {
+        VkClearAttachment &depth_stencil_attachment =
+            attachments[attachment_count++];
+        if (ac6_rect_clear_plan.clear_depth) {
+          depth_stencil_attachment.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        }
+        if (ac6_rect_clear_plan.clear_stencil) {
+          depth_stencil_attachment.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+        depth_stencil_attachment.clearValue.depthStencil.depth =
+            ac6_rect_clear_plan.depth;
+        depth_stencil_attachment.clearValue.depthStencil.stencil =
+            ac6_rect_clear_plan.stencil;
+      }
+      VkClearRect clear_rect = {};
+      clear_rect.rect.offset.x = int32_t(clear_x);
+      clear_rect.rect.offset.y = int32_t(clear_y);
+      clear_rect.rect.extent.width = uint32_t(clear_width);
+      clear_rect.rect.extent.height = uint32_t(clear_height);
+      clear_rect.baseArrayLayer = 0;
+      clear_rect.layerCount = 1;
+      deferred_command_buffer_.CmdVkClearAttachments(
+          attachment_count, attachments, 1, &clear_rect);
+      if (ac6_rect_clear_oracle_candidate) {
+        uint32_t color_bits[4] = {};
+        uint32_t depth_bits = 0;
+        std::memcpy(color_bits, ac6_rect_clear_plan.color.float32,
+                    sizeof(color_bits));
+        std::memcpy(&depth_bits, &ac6_rect_clear_plan.depth,
+                    sizeof(depth_bits));
+        std::fprintf(
+            stderr,
+            "AC6_RECT_CLEAR_ORACLE decision=accept mode=%u x=%u y=%u "
+            "width=%u height=%u color=%u depth=%u stencil=%u "
+            "rgba=%08x,%08x,%08x,%08x depth_bits=%08x stencil_value=%u\n",
+            uint32_t(ac6_rect_clear_edram_mode), ac6_rect_clear_plan.x,
+            ac6_rect_clear_plan.y, ac6_rect_clear_plan.width,
+            ac6_rect_clear_plan.height,
+            uint32_t(ac6_rect_clear_plan.clear_color),
+            uint32_t(ac6_rect_clear_plan.clear_depth),
+            uint32_t(ac6_rect_clear_plan.clear_stencil), color_bits[0],
+            color_bits[1], color_bits[2], color_bits[3], depth_bits,
+            uint32_t(ac6_rect_clear_plan.stencil));
+        std::fflush(stderr);
+      }
+      static bool ac6_rect_clear_lowering_logged = false;
+      if (!ac6_rect_clear_lowering_logged) {
+        ac6_rect_clear_lowering_logged = true;
+        // One-shot production proof. Performance mode forces error-only logs.
+        REXGPU_ERROR(
+            "AC6 exact rectangle clear lowering active ({}x{} at {}, {}, "
+            "color={}, depth={}, stencil={})",
+            ac6_rect_clear_plan.width, ac6_rect_clear_plan.height,
+            ac6_rect_clear_plan.x, ac6_rect_clear_plan.y,
+            ac6_rect_clear_plan.clear_color, ac6_rect_clear_plan.clear_depth,
+            ac6_rect_clear_plan.clear_stencil);
+      }
+      return true;
+    }
+    if (ac6_rect_clear_oracle_candidate) {
+      std::fprintf(
+          stderr,
+          "AC6_RECT_CLEAR_ORACLE decision=reject stage=post_rtc mode=%u "
+          "reason=attachments_mismatch framebuffer=%u scale_x=%u scale_y=%u "
+          "expected=%u used=%u msaa=%u transfer=%u depth_key=%u depth_reg=%u "
+          "clear_x=%llu clear_y=%llu clear_width=%llu clear_height=%llu "
+          "extent_width=%u extent_height=%u\n",
+          uint32_t(ac6_rect_clear_edram_mode), uint32_t(framebuffer != nullptr),
+          scale_x, scale_y, expected_attachments,
+          uint32_t(render_pass_key.depth_and_color_used),
+          uint32_t(render_pass_key.msaa_samples),
+          uint32_t(render_pass_key.color_rts_use_transfer_formats),
+          uint32_t(render_pass_key.depth_format),
+          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format),
+          static_cast<unsigned long long>(clear_x),
+          static_cast<unsigned long long>(clear_y),
+          static_cast<unsigned long long>(clear_width),
+          static_cast<unsigned long long>(clear_height),
+          framebuffer ? framebuffer->host_extent.width : 0,
+          framebuffer ? framebuffer->host_extent.height : 0);
+      std::fflush(stderr);
+    }
+  }
+
+  // Select the pipeline after render-target setup has supplied the exact render
+  // pass key. In shared-authority mode, describe the SDK pipeline first so the
+  // native renderer can select its compatible pipeline without creating or
+  // queueing the SDK pipeline. If that early path rejects the draw for any
+  // reason, fall through to the unchanged SDK ConfigurePipeline path.
+  VkPipeline pipeline = VK_NULL_HANDLE;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
-    return draw_fail("configure_pipeline");
+  static_assert(
+      VulkanPipelineCache::PipelineDescriptionExport::kSize ==
+          ac6::backend::kNativeVulkanPipelineDescriptionSize,
+      "Native renderer bridge must preserve the exact pipeline description");
+  bool host_render_targets_used =
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+  bool native_pipeline_selected = false;
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_native_prepare_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kNativePrepare);
+  if (native_shared_authority) {
+    if (ac6_nr2_hotpath_profile) {
+      ++ac6_nr2_hotpath_profile_state.shared_draw_count;
+    }
+    VulkanPipelineCache::ExternalPipelineDescription external_pipeline_description;
+    if (pipeline_cache_->DescribePipelineForExternalUse(
+            vertex_shader_translation, pixel_shader_translation,
+            primitive_processing_result, normalized_depth_control,
+            normalized_color_mask,
+            render_target_cache_->last_update_render_pass_key(),
+            external_pipeline_description) &&
+        external_pipeline_description.layout != nullptr) {
+      auto external_pipeline_layout = static_cast<const PipelineLayout*>(
+          external_pipeline_description.layout);
+      ac6::backend::NativeVulkanDrawRequest native_request;
+      native_request.command_processor = this;
+      native_request.device = GetVulkanDevice()->device();
+      native_request.pipeline_layout =
+          external_pipeline_layout->GetPipelineLayout();
+      native_request.pipeline_description_hash =
+          external_pipeline_description.hash;
+      std::memcpy(native_request.pipeline_description,
+                  external_pipeline_description.description.bytes,
+                  sizeof(native_request.pipeline_description));
+      native_request.vertex_shader =
+          external_pipeline_description.vertex_shader;
+      native_request.pixel_shader =
+          external_pipeline_description.pixel_shader;
+      native_request.generated_geometry_shader =
+          external_pipeline_description.generated_geometry_shader;
+      native_request.host_vertex_shader_type =
+          uint32_t(primitive_processing_result.host_vertex_shader_type);
+      // This is the same condition used when the authoritative render-target
+      // scope is entered below. Selecting the compatible native pipeline here
+      // lets it flow through the normal single-bind guest pipeline path without
+      // invalidating the SDK layout and descriptor tracking.
+      native_request.dynamic_rendering =
+          REXCVAR_GET(vulkan_dynamic_rendering) &&
+          GetVulkanDevice()->properties().dynamicRendering;
+      native_request.host_render_targets = host_render_targets_used;
+      native_request.memexport_writes_possible = memexport_writes_possible;
+      ac6::backend::NativeVulkanDrawPlan native_plan;
+      if (ac6::backend::NativeRendererPrepareVulkanDraw(native_request,
+                                                         native_plan) &&
+          native_plan.device == native_request.device &&
+          native_plan.pipeline_layout == native_request.pipeline_layout &&
+          native_plan.pipeline != VK_NULL_HANDLE) {
+        pipeline = native_plan.pipeline;
+        pipeline_layout_provider = external_pipeline_description.layout;
+        native_pipeline_selected = true;
+        if (ac6_nr2_hotpath_profile) {
+          ++ac6_nr2_hotpath_profile_state.native_prepare_accepted_count;
+        }
+      }
+    }
   }
-  bool pipeline_is_placeholder = false;
-  // Reload the current handle state to observe async hot-swap completions that
-  // may happen between pipeline configuration and binding.
-  pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
-                                                &pipeline_is_placeholder);
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
-    frame_used_async_placeholder_pipeline_ = true;
-    return true;
+  ac6_nr2_hotpath_native_prepare_timer.Stop();
+
+  if (!native_pipeline_selected) {
+    Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_configure_pipeline_timer(
+        ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kConfigurePipeline);
+    if (!pipeline_cache_->ConfigurePipeline(
+            vertex_shader_translation, pixel_shader_translation,
+            primitive_processing_result, normalized_depth_control,
+            normalized_color_mask,
+            render_target_cache_->last_update_render_pass_key(), pipeline,
+            pipeline_layout_provider, &pipeline_handle)) {
+      return draw_fail("configure_pipeline");
+    }
+    bool pipeline_is_placeholder = false;
+    // Reload the current handle state to observe async hot-swap completions that
+    // may happen between pipeline configuration and binding.
+    pipeline_cache_->GetPipelineAndLayoutByHandle(
+        pipeline_handle, pipeline, pipeline_layout_provider,
+        &pipeline_is_placeholder);
+    if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+      frame_used_async_placeholder_pipeline_ = true;
+      return true;
+    }
+    if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+      return draw_fail("pipeline_lookup");
+    }
+    ac6_nr2_hotpath_configure_pipeline_timer.Stop();
   }
-  if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
-    return draw_fail("pipeline_lookup");
-  }
+
+  auto pipeline_layout =
+      static_cast<const PipelineLayout*>(pipeline_layout_provider);
+
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_state_binding_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kStateBinding);
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
@@ -3919,7 +5212,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Update the graphics pipeline, and if the new graphics pipeline has a
   // different layout, invalidate incompatible descriptor sets before updating
   // current_guest_graphics_pipeline_layout_.
-  auto pipeline_layout = static_cast<const PipelineLayout*>(pipeline_layout_provider);
   if (current_guest_graphics_pipeline_layout_ != pipeline_layout) {
     if (current_guest_graphics_pipeline_layout_) {
       // Keep descriptor set layouts for which the new pipeline layout is
@@ -3936,6 +5228,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
       }
+      // Sets at and above the first incompatible layout must be rebound. Keeping
+      // their old "up to date" bits can bind stale AC6 world textures against a
+      // different pipeline layout and turn otherwise valid draws into black.
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          (UINT32_C(1) << descriptor_sets_kept) - 1;
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
@@ -3944,8 +5241,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
 
-  bool host_render_targets_used =
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
@@ -4012,25 +5307,36 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
+  ac6_nr2_hotpath_state_binding_timer.Stop();
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_update_bindings_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kUpdateBindings);
   if (!UpdateBindings(vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
+  ac6_nr2_hotpath_update_bindings_timer.Stop();
 
-  // Ensure vertex buffers are resident.
+  // Ensure vertex buffers are resident for every draw. AC6 rewrites dynamic
+  // vertex data at the same guest address multiple times within one frame, so
+  // a per-frame fetch-constant bit cannot prove that the current contents are
+  // synchronized. RequestRange still avoids uploading clean pages internally.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  // Batched: one RequestRanges call per draw instead of one heap-allocating
+  // RequestRange call per vfetch constant (thousands per frame in city
+  // missions).
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_memory_residency_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kMemoryResidency);
+  std::array<std::pair<uint32_t, uint32_t>, 96> vfetch_ranges;
+  uint32_t vfetch_range_count = 0;
+  static_assert(sizeof(constant_map_vertex.vertex_fetch_bitmap) * 8 <= 96);
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
     uint32_t j;
     while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
-      uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-        continue;
-      }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
@@ -4051,15 +5357,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
-        REXGPU_ERROR(
-            "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
-            "memory",
-            vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
-      }
-      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+      vfetch_ranges[vfetch_range_count++] = {vfetch_constant.address << 2,
+                                             vfetch_constant.size << 2};
     }
+  }
+  if (vfetch_range_count &&
+      !shared_memory_->RequestRanges(vfetch_ranges.data(), vfetch_range_count)) {
+    REXGPU_ERROR("Failed to request {} vertex buffer ranges in the shared memory",
+                 vfetch_range_count);
+    return false;
   }
 
   // Synchronize the memory pages backing memory scatter export streams, and
@@ -4149,10 +5455,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
+  ac6_nr2_hotpath_memory_residency_timer.Stop();
 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_draw_record_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kDrawRecord);
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
@@ -4195,8 +5504,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  ac6_nr2_hotpath_draw_record_timer.Stop();
 
   // Invalidate textures in memexported memory and watch for changes.
+  Ac6Nr2HotpathPhaseTimer ac6_nr2_hotpath_post_draw_timer(
+      ac6_nr2_hotpath_profile, Ac6Nr2HotpathPhase::kPostDraw);
   if (!memexport_ranges_.empty()) {
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
@@ -4208,8 +5520,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
-      !memexport_ranges_.empty()) {
+  // Most draws don't export memory. Check the draw-local state first so they
+  // don't pay for the legacy/shared CVar resolution on every draw.
+  if (!memexport_ranges_.empty() &&
+      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
@@ -4222,6 +5536,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
     }
   }
+
+  // Feed the experimental AC6 native renderer only after the PM4 draw has
+  // been decoded successfully. At this point the register file and analyzed
+  // active shaders are the exact command state, unlike the asynchronous guest
+  // D3D hook snapshots.
+  if (!native_shared_authority) {
+    ac6::backend::NativeRendererOnGpuDraw(
+        this, register_file_, memory_, uint32_t(prim_type), index_count);
+  }
+  ac6_nr2_hotpath_post_draw_timer.Stop();
 
   return true;
 }
@@ -4432,13 +5756,33 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  bool result = false;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                           written_address, written_length);
+  } else {
+    result = IssueCopy_ReadbackResolvePath();
   }
-
-  return IssueCopy_ReadbackResolvePath();
+  if (result) {
+    // With native takeover enabled, Init forces full immediate readback, so
+    // guest memory now contains the same-command emulator oracle. The native
+    // copy callback may propagate only if its exact safety gate passes.
+    uint32_t native_written_address = 0;
+    uint32_t native_written_length = 0;
+    if (ac6::backend::NativeRendererOnGpuCopy(
+            this, register_file_, memory_, &native_written_address,
+            &native_written_length) &&
+        native_written_length) {
+      // The native callback writes CPU guest memory while holding its private
+      // session lock. Invalidate only after it returns: this avoids re-entering
+      // native state while making the emulator's shared-memory/texture users
+      // observe the newly propagated bytes.
+      TracePlaybackWroteMemory(native_written_address,
+                               native_written_length);
+    }
+  }
+  return result;
 }
 
 bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -4768,6 +6112,285 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
     }
     it = buffer_map.erase(it);
   }
+}
+
+bool VulkanCommandProcessor::InitializeAc6GpuPassProfile() {
+  ac6_gpu_pass_profile_interval_ =
+      REXCVAR_GET(vulkan_gpu_pass_profile_interval);
+  ac6_gpu_pass_profile_query_pool_ = VK_NULL_HANDLE;
+  ac6_gpu_pass_profile_timestamp_period_ns_ = 0.0;
+  ac6_gpu_pass_profile_timestamp_valid_bits_ = 0;
+  ac6_gpu_pass_profile_frame_active_ = false;
+  ac6_gpu_pass_profile_frame_ready_ = false;
+  ac6_gpu_pass_profile_pending_buckets_.clear();
+  if (!ac6_gpu_pass_profile_interval_) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const auto& ifn = vulkan_device->vulkan_instance()->functions();
+  VkPhysicalDeviceProperties physical_device_properties = {};
+  ifn.vkGetPhysicalDeviceProperties(vulkan_device->physical_device(),
+                                    &physical_device_properties);
+  ac6_gpu_pass_profile_timestamp_period_ns_ =
+      double(physical_device_properties.limits.timestampPeriod);
+
+  uint32_t queue_family_count = 0;
+  ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(),
+                                               &queue_family_count, nullptr);
+  std::vector<VkQueueFamilyProperties> queue_family_properties(
+      queue_family_count);
+  ifn.vkGetPhysicalDeviceQueueFamilyProperties(
+      vulkan_device->physical_device(), &queue_family_count,
+      queue_family_properties.data());
+  const uint32_t graphics_queue_family =
+      vulkan_device->queue_family_graphics_compute();
+  if (graphics_queue_family < queue_family_count) {
+    ac6_gpu_pass_profile_timestamp_valid_bits_ =
+        queue_family_properties[graphics_queue_family].timestampValidBits;
+  }
+  if (ac6_gpu_pass_profile_timestamp_period_ns_ <= 0.0 ||
+      !ac6_gpu_pass_profile_timestamp_valid_bits_) {
+    REXGPU_WARN(
+        "AC6 GPU pass profiler requested, but the graphics queue does not "
+        "support timestamps");
+    ac6_gpu_pass_profile_interval_ = 0;
+    return false;
+  }
+
+  VkQueryPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  pool_info.queryCount = kAc6GpuPassProfileMaxTimestamps;
+  const auto& dfn = vulkan_device->functions();
+  if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                            &ac6_gpu_pass_profile_query_pool_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the AC6 GPU pass timestamp query pool");
+    ac6_gpu_pass_profile_query_pool_ = VK_NULL_HANDLE;
+    ac6_gpu_pass_profile_interval_ = 0;
+    return false;
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::ShutdownAc6GpuPassProfile() {
+  if (ac6_gpu_pass_profile_query_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+    vulkan_device->functions().vkDestroyQueryPool(
+        vulkan_device->device(), ac6_gpu_pass_profile_query_pool_, nullptr);
+  }
+  ac6_gpu_pass_profile_query_pool_ = VK_NULL_HANDLE;
+  ac6_gpu_pass_profile_timestamp_period_ns_ = 0.0;
+  ac6_gpu_pass_profile_timestamp_valid_bits_ = 0;
+  ac6_gpu_pass_profile_interval_ = 0;
+  ac6_gpu_pass_profile_query_count_ = 0;
+  ac6_gpu_pass_profile_frame_active_ = false;
+  ac6_gpu_pass_profile_frame_ready_ = false;
+  ac6_gpu_pass_profile_pending_buckets_.clear();
+}
+
+void VulkanCommandProcessor::BeginAc6GpuPassProfileFrame() {
+  if (ac6_gpu_pass_profile_query_pool_ == VK_NULL_HANDLE ||
+      !ac6_gpu_pass_profile_interval_) {
+    return;
+  }
+  assert_true(submission_open_);
+  ac6_gpu_pass_profile_query_count_ = 1;
+  ac6_gpu_pass_profile_command_count_ = 0;
+  ac6_gpu_pass_profile_range_first_command_ = 0;
+  ac6_gpu_pass_profile_range_command_count_ = 0;
+  ac6_gpu_pass_profile_range_draw_count_ = 0;
+  ac6_gpu_pass_profile_range_copy_count_ = 0;
+  ac6_gpu_pass_profile_range_cpu_issue_draw_nanoseconds_ = 0;
+  ac6_gpu_pass_profile_range_cpu_issue_draw_phase_nanoseconds_.fill(0);
+  ac6_gpu_pass_profile_previous_command_was_copy_ = false;
+  ac6_gpu_pass_profile_frame_active_ = true;
+  ac6_gpu_pass_profile_frame_ready_ = false;
+  ac6_gpu_pass_profile_pending_buckets_.clear();
+
+  // Reset is legal here because a newly opened guest frame has no active
+  // render pass. The top-of-pipe sample is the common origin for every bucket.
+  deferred_command_buffer_.CmdVkResetQueryPool(
+      ac6_gpu_pass_profile_query_pool_, 0,
+      kAc6GpuPassProfileMaxTimestamps);
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      ac6_gpu_pass_profile_query_pool_, 0);
+}
+
+bool VulkanCommandProcessor::AppendAc6GpuPassProfileBoundary(
+    bool includes_swap) {
+  if (!ac6_gpu_pass_profile_frame_active_ ||
+      ac6_gpu_pass_profile_query_pool_ == VK_NULL_HANDLE ||
+      (!ac6_gpu_pass_profile_range_command_count_ && !includes_swap)) {
+    return false;
+  }
+
+  // Intermediate boundaries leave one slot reserved for the mandatory final
+  // timestamp after the swap tail and all pending barriers.
+  const uint32_t query_limit =
+      includes_swap ? kAc6GpuPassProfileMaxTimestamps
+                    : kAc6GpuPassProfileMaxTimestamps - 1;
+  if (ac6_gpu_pass_profile_query_count_ >= query_limit) {
+    if (!ac6_gpu_pass_profile_overflow_logged_) {
+      ac6_gpu_pass_profile_overflow_logged_ = true;
+      REXGPU_WARN(
+          "AC6 GPU pass profiler exhausted {} timestamp slots; merging the "
+          "remaining guest commands into the final bucket",
+          kAc6GpuPassProfileMaxTimestamps);
+    }
+    return false;
+  }
+
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+      ac6_gpu_pass_profile_query_pool_,
+      ac6_gpu_pass_profile_query_count_++);
+
+  Ac6GpuPassProfilePendingBucket bucket;
+  bucket.first_command = ac6_gpu_pass_profile_range_first_command_;
+  bucket.last_command = ac6_gpu_pass_profile_command_count_
+                            ? ac6_gpu_pass_profile_command_count_ - 1
+                            : 0;
+  bucket.draw_count = ac6_gpu_pass_profile_range_draw_count_;
+  bucket.copy_count = ac6_gpu_pass_profile_range_copy_count_;
+  bucket.includes_swap = includes_swap;
+  bucket.cpu_issue_draw_nanoseconds =
+      ac6_gpu_pass_profile_range_cpu_issue_draw_nanoseconds_;
+  bucket.cpu_issue_draw_phase_nanoseconds =
+      ac6_gpu_pass_profile_range_cpu_issue_draw_phase_nanoseconds_;
+  ac6_gpu_pass_profile_pending_buckets_.push_back(bucket);
+
+  ac6_gpu_pass_profile_range_first_command_ =
+      ac6_gpu_pass_profile_command_count_;
+  ac6_gpu_pass_profile_range_command_count_ = 0;
+  ac6_gpu_pass_profile_range_draw_count_ = 0;
+  ac6_gpu_pass_profile_range_copy_count_ = 0;
+  ac6_gpu_pass_profile_range_cpu_issue_draw_nanoseconds_ = 0;
+  ac6_gpu_pass_profile_range_cpu_issue_draw_phase_nanoseconds_.fill(0);
+  return true;
+}
+
+void VulkanCommandProcessor::BeginAc6GpuPassProfileGuestCommand(
+    bool is_copy) {
+  if (!ac6_gpu_pass_profile_frame_active_) {
+    return;
+  }
+
+  // Split both sides of every resolve so the resolve itself becomes an
+  // independently attributable bucket. Ordinary draw ranges are bounded by
+  // the requested interval.
+  if (ac6_gpu_pass_profile_range_command_count_ &&
+      (ac6_gpu_pass_profile_range_command_count_ >=
+           ac6_gpu_pass_profile_interval_ ||
+       is_copy || ac6_gpu_pass_profile_previous_command_was_copy_)) {
+    AppendAc6GpuPassProfileBoundary(false);
+  }
+
+  if (!ac6_gpu_pass_profile_range_command_count_) {
+    ac6_gpu_pass_profile_range_first_command_ =
+        ac6_gpu_pass_profile_command_count_;
+  }
+  ++ac6_gpu_pass_profile_range_command_count_;
+  if (is_copy) {
+    ++ac6_gpu_pass_profile_range_copy_count_;
+  } else {
+    ++ac6_gpu_pass_profile_range_draw_count_;
+  }
+  ++ac6_gpu_pass_profile_command_count_;
+  ac6_gpu_pass_profile_previous_command_was_copy_ = is_copy;
+}
+
+void VulkanCommandProcessor::AddAc6GpuPassProfileGuestCommandCpuTime(
+    uint64_t nanoseconds,
+    const std::array<uint64_t, kAc6Nr2HotpathPhaseCount>&
+        phase_nanoseconds) {
+  assert_true(ac6_gpu_pass_profile_frame_active_);
+  assert_not_zero(ac6_gpu_pass_profile_range_command_count_);
+  ac6_gpu_pass_profile_range_cpu_issue_draw_nanoseconds_ += nanoseconds;
+  for (size_t phase = 0; phase < phase_nanoseconds.size(); ++phase) {
+    ac6_gpu_pass_profile_range_cpu_issue_draw_phase_nanoseconds_[phase] +=
+        phase_nanoseconds[phase];
+  }
+}
+
+void VulkanCommandProcessor::EndAc6GpuPassProfileFrame() {
+  if (!ac6_gpu_pass_profile_frame_active_) {
+    return;
+  }
+  const bool appended = AppendAc6GpuPassProfileBoundary(true);
+  ac6_gpu_pass_profile_frame_active_ = false;
+  ac6_gpu_pass_profile_frame_ready_ = appended;
+}
+
+bool VulkanCommandProcessor::ReadAc6GpuPassProfile(
+    std::vector<Ac6GpuPassProfileBucket>& buckets_out) const {
+  buckets_out.clear();
+  if (!ac6_gpu_pass_profile_frame_ready_ ||
+      ac6_gpu_pass_profile_query_pool_ == VK_NULL_HANDLE ||
+      ac6_gpu_pass_profile_query_count_ < 2 ||
+      ac6_gpu_pass_profile_pending_buckets_.size() + 1 !=
+          ac6_gpu_pass_profile_query_count_) {
+    return false;
+  }
+
+  // Include availability words so a caller that forgot the required device
+  // wait fails closed instead of reporting partial or stale timestamps.
+  std::vector<uint64_t> query_data(
+      size_t(ac6_gpu_pass_profile_query_count_) * 2);
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkResult result = dfn.vkGetQueryPoolResults(
+      vulkan_device->device(), ac6_gpu_pass_profile_query_pool_, 0,
+      ac6_gpu_pass_profile_query_count_,
+      query_data.size() * sizeof(uint64_t), query_data.data(),
+      2 * sizeof(uint64_t),
+      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+  if (result != VK_SUCCESS) {
+    return false;
+  }
+  for (uint32_t query = 0; query < ac6_gpu_pass_profile_query_count_;
+       ++query) {
+    if (!query_data[size_t(query) * 2 + 1]) {
+      return false;
+    }
+  }
+
+  const double milliseconds_per_tick =
+      ac6_gpu_pass_profile_timestamp_period_ns_ / 1000000.0;
+  buckets_out.reserve(ac6_gpu_pass_profile_pending_buckets_.size());
+  for (size_t bucket_index = 0;
+       bucket_index < ac6_gpu_pass_profile_pending_buckets_.size();
+       ++bucket_index) {
+    const Ac6GpuPassProfilePendingBucket& pending =
+        ac6_gpu_pass_profile_pending_buckets_[bucket_index];
+    const uint64_t begin = query_data[bucket_index * 2];
+    const uint64_t end = query_data[(bucket_index + 1) * 2];
+    Ac6GpuPassProfileBucket bucket;
+    bucket.first_command = pending.first_command;
+    bucket.last_command = pending.last_command;
+    bucket.draw_count = pending.draw_count;
+    bucket.copy_count = pending.copy_count;
+    bucket.includes_swap = pending.includes_swap;
+    bucket.cpu_issue_draw_milliseconds =
+        double(pending.cpu_issue_draw_nanoseconds) / 1000000.0;
+    for (size_t phase = 0;
+         phase < bucket.cpu_issue_draw_phase_milliseconds.size(); ++phase) {
+      bucket.cpu_issue_draw_phase_milliseconds[phase] =
+          double(pending.cpu_issue_draw_phase_nanoseconds[phase]) /
+          1000000.0;
+    }
+    const uint64_t timestamp_mask =
+        ac6_gpu_pass_profile_timestamp_valid_bits_ >= 64
+            ? UINT64_MAX
+            : (UINT64_C(1) << ac6_gpu_pass_profile_timestamp_valid_bits_) - 1;
+    // Timestamp counters may expose fewer than 64 valid bits. Masked unsigned
+    // subtraction handles a wrap between adjacent samples without ambiguity.
+    const uint64_t elapsed_ticks = (end - begin) & timestamp_mask;
+    bucket.gpu_milliseconds = double(elapsed_ticks) * milliseconds_per_tick;
+    buckets_out.push_back(bucket);
+  }
+  return true;
 }
 
 bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
@@ -5221,7 +6844,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   }
 
   if (is_opening_frame) {
+    BeginAc6GpuPassProfileFrame();
     frame_open_ = true;
+    primary_buffer_ends_without_present_ = 0;
     frame_used_async_placeholder_pipeline_ = false;
 
     // Reset bindings that depend on transient data.
@@ -5233,6 +6858,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         shared_memory_and_edram_descriptor_set_;
     current_graphics_descriptor_set_values_up_to_date_ =
         UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+    // Transient texture/sampler descriptor sets written in completed frames
+    // are recycled by the reclaiming below and may be rewritten with other
+    // contents - the per-stage reuse caches must never outlive the frame
+    // their sets were written in.
+    reusable_texture_descriptors_vertex_.valid = false;
+    reusable_texture_descriptors_pixel_.valid = false;
 
     // Reclaim pool pages - no need to do this every small submission since some
     // may be reused.
@@ -5429,6 +7060,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     SubmitBarriers(true);
 
+    // End the frame-wide timestamp range after every deferred barrier and
+    // swap-tail command has been appended, but before materializing the stream
+    // into the real Vulkan command buffer.
+    if (is_closing_frame) {
+      EndAc6GpuPassProfileFrame();
+    }
+
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
     if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
@@ -5506,6 +7144,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
     frame_open_ = false;
+    primary_buffer_ends_without_present_ = 0;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 
@@ -5546,6 +7185,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+  // The per-stage reuse caches refer to sets allocated from these pools.
+  reusable_texture_descriptors_vertex_.valid = false;
+  reusable_texture_descriptors_pixel_.valid = false;
+
   texture_transient_descriptor_sets_free_.clear();
   texture_transient_descriptor_sets_used_.clear();
   transient_descriptor_allocator_textures_.Reset();
@@ -6616,32 +8259,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-
-  // Make sure new descriptor sets are bound to the command buffer.
-
-  current_graphics_descriptor_sets_bound_up_to_date_ &=
-      current_graphics_descriptor_set_values_up_to_date_;
-
-  // Fill the texture and sampler write image infos.
-
-  bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-  bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Gather the descriptor image infos the texture and sampler descriptor sets
+  // of each stage would contain for this draw. Gathered unconditionally
+  // (rather than only for sets already known to need rewriting) so they can
+  // be compared against the previously written contents for reuse.
   descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+  descriptor_write_image_info_.reserve(size_t(texture_count_vertex) + sampler_count_vertex +
+                                       texture_count_pixel + sampler_count_pixel);
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
+  if (texture_count_vertex) {
     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6653,7 +8279,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
+  if (sampler_count_vertex) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_vertex_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
@@ -6661,7 +8287,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
+  if (texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6673,13 +8299,91 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
+  if (sampler_count_pixel) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_pixel_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
     }
   }
+
+  // Texture and sampler descriptor set reuse. A stage's transient descriptor
+  // set from an earlier draw can be reused if it was written in the current
+  // submission, with the same descriptor set layout as the one the current
+  // pipeline layout references, and with byte-identical image infos.
+  // The submission scoping makes reuse provably safe against object
+  // destruction: every image view written into the set was usage-marked (via
+  // the RequestTextures / UseSampler calls of the draw that wrote it) at the
+  // currently open submission number, which is never completed while the
+  // submission is open, so the texture cache cannot destroy those views (and
+  // no new view can alias their handles) between the write and any reusing
+  // draw. Transient sets themselves are only recycled at frame open, so
+  // within a submission a cached set is always live and correctly filled.
+  // current_guest_graphics_pipeline_layout_ has already been updated for this
+  // draw before UpdateBindings is called, so the layout comparison is against
+  // the layout this draw actually uses - a set written for a different layout
+  // is always rewritten, keeping the "sets at and above an incompatible
+  // layout must be rebound" handling (see the pipeline layout switch in the
+  // draw function) intact.
+  bool reuse_texture_descriptors = REXCVAR_GET(vulkan_reuse_texture_descriptors);
+  uint64_t reuse_submission = GetCurrentSubmission();
+  auto texture_bindings_reusable = [&](const ReusableTextureDescriptorSetState& state,
+                                       VkDescriptorSetLayout layout, uint32_t texture_count,
+                                       uint32_t sampler_count, size_t image_info_offset) -> bool {
+    size_t image_info_count = size_t(texture_count) + sampler_count;
+    return state.valid && state.submission == reuse_submission && state.layout == layout &&
+           state.texture_count == texture_count && state.sampler_count == sampler_count &&
+           state.image_info.size() == image_info_count &&
+           !std::memcmp(state.image_info.data(),
+                        descriptor_write_image_info_.data() + image_info_offset,
+                        sizeof(VkDescriptorImageInfo) * image_info_count);
+  };
+  bool invalidate_vertex_textures = true;
+  bool invalidate_pixel_textures = true;
+  if (reuse_texture_descriptors) {
+    if (texture_count_vertex || sampler_count_vertex) {
+      invalidate_vertex_textures = !texture_bindings_reusable(
+          reusable_texture_descriptors_vertex_,
+          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
+          texture_count_vertex, sampler_count_vertex, vertex_texture_image_info_offset);
+    } else {
+      // The set is not needed for this draw at all - keep the cached contents
+      // (and the "up to date" bit) for a later draw that may match them.
+      invalidate_vertex_textures = false;
+    }
+    if (texture_count_pixel || sampler_count_pixel) {
+      invalidate_pixel_textures = !texture_bindings_reusable(
+          reusable_texture_descriptors_pixel_,
+          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
+          texture_count_pixel, sampler_count_pixel, pixel_texture_image_info_offset);
+    } else {
+      invalidate_pixel_textures = false;
+    }
+  }
+  if (invalidate_vertex_textures) {
+    reusable_texture_descriptors_vertex_.valid = false;
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+  }
+  if (invalidate_pixel_textures) {
+    reusable_texture_descriptors_pixel_.valid = false;
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  }
+
+  // Make sure new descriptor sets are bound to the command buffer.
+
+  current_graphics_descriptor_sets_bound_up_to_date_ &=
+      current_graphics_descriptor_set_values_up_to_date_;
+
+  bool write_vertex_textures =
+      (texture_count_vertex || sampler_count_vertex) &&
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+  bool write_pixel_textures =
+      (texture_count_pixel || sampler_count_pixel) &&
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
 
   // Write the new descriptor sets.
 
@@ -6771,6 +8475,43 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
+
+  // Record the successfully written texture/sampler sets in the reuse caches.
+  // Done only after vkUpdateDescriptorSets - a failed allocation for a later
+  // set returns from this function before the update, and must not leave a
+  // cache entry describing contents that were never actually written.
+  if (reuse_texture_descriptors) {
+    if (write_descriptor_set_bits &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex)) {
+      ReusableTextureDescriptorSetState& state = reusable_texture_descriptors_vertex_;
+      state.submission = reuse_submission;
+      state.layout =
+          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref();
+      state.texture_count = texture_count_vertex;
+      state.sampler_count = sampler_count_vertex;
+      size_t image_info_count = size_t(texture_count_vertex) + sampler_count_vertex;
+      state.image_info.resize(image_info_count);
+      std::memcpy(state.image_info.data(),
+                  descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+                  sizeof(VkDescriptorImageInfo) * image_info_count);
+      state.valid = true;
+    }
+    if (write_descriptor_set_bits &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel)) {
+      ReusableTextureDescriptorSetState& state = reusable_texture_descriptors_pixel_;
+      state.submission = reuse_submission;
+      state.layout =
+          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
+      state.texture_count = texture_count_pixel;
+      state.sampler_count = sampler_count_pixel;
+      size_t image_info_count = size_t(texture_count_pixel) + sampler_count_pixel;
+      state.image_info.resize(image_info_count);
+      std::memcpy(state.image_info.data(),
+                  descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+                  sizeof(VkDescriptorImageInfo) * image_info_count);
+      state.valid = true;
+    }
+  }
 
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;

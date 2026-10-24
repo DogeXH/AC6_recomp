@@ -1,0 +1,12 @@
+# /etc/default/ac6lobby: settings for the ac6lobby systemd service.
+# After a change: sudo systemctl restart ac6lobby
+#
+# UDP address for the game protocol (open this port in the firewall).
+AC6LOBBY_UDP=:47800
+# Status page (counts only). Loopback by default; ":47801" makes it public (open TCP 47801).
+# Empty disables it.
+AC6LOBBY_HTTP=127.0.0.1:47801
+# Admin interface; loopback addresses only. Use: sudo ac6lobby admin players
+AC6LOBBY_ADMIN=127.0.0.1:47802
+# Extra flags, split at spaces (no quoting), for example: -log-format json -stats-interval 5m
+AC6LOBBY_ARGS=

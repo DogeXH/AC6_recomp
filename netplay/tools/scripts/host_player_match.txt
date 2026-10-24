@@ -1,0 +1,40 @@
+# PLACEHOLDER - instance A (Talisman) hosts a Player Match.
+# The menu path below is a GUESS: AC6's online menu navigation has not been explored yet.
+# Replace the marked block once the main session has mapped the menus (screenshots via
+# shots/capture.now). Format: netplay/docs/TESTING.md, "Input scripts".
+#
+# Pair with join_player_match.txt on instance B. B waits for the file this script creates.
+
+log host: waiting for sign-in to Live
+wait_trace "ev":"xam.live" 120000
+screenshot_every 2000 shots/host_frames
+
+# Title screen -> main menu. AC6 shows "Press START" after the intro.
+wait 15000
+press START
+wait 3000
+screenshot shots/host_main_menu.ppm
+
+# ---- PLACEHOLDER: main menu -> Xbox LIVE -> Player Match -> Create Session -------------
+# Unknown: the number of DOWN presses to reach the online entry, and the confirm dialogs.
+press DOWN
+press DOWN
+press A
+wait 3000
+screenshot shots/host_online_menu.ppm
+press A
+wait 3000
+press A
+# ---- end of placeholder block ----------------------------------------------------------
+
+# The glue traces session creation; the session must exist before B searches.
+wait_trace "ev":"xgi.create" 60000
+log host: session created
+screenshot shots/host_lobby.ppm
+# Tell B (its wait_file) that the session is up. Relative paths are resolved against the
+# instance directory, so ../ is the shared instances/ directory.
+touch ../host_session_ready.flag
+wait_trace "ev":"xgi.join" 180000
+log host: a remote player joined
+screenshot shots/host_lobby_joined.ppm
+screenshot_stop

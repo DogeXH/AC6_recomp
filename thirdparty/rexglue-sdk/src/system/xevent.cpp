@@ -17,12 +17,14 @@ void XEvent::Initialize(bool manual_reset, bool initial_state) {
 
   this->CreateNative<X_KEVENT>();
 
+  manual_reset_ = manual_reset;
   if (manual_reset) {
     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);
   } else {
     event_ = rex::thread::Event::CreateAutoResetEvent(initial_state);
   }
   assert_not_null(event_);
+  UpdateGuestSignalState(initial_state ? 1 : 0);
 }
 
 void XEvent::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
@@ -67,22 +69,43 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
 }
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
-  event_->Set();
-  return 1;
+  // Guest code polls the dispatch header directly. Publish guest state before
+  // releasing a host waiter so the awakened thread cannot observe stale zero.
+  UpdateGuestSignalState(1);
+  return event_->SetQueryPrevious() ? 1 : 0;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
-  event_->Pulse();
-  return 1;
+  const bool previous = event_->PulseQueryPrevious();
+  UpdateGuestSignalState(0);
+  return previous ? 1 : 0;
 }
 
 int32_t XEvent::Reset() {
-  event_->Reset();
-  return 1;
+  const bool previous = event_->ResetQueryPrevious();
+  UpdateGuestSignalState(0);
+  return previous ? 1 : 0;
 }
 
 void XEvent::Clear() {
   event_->Reset();
+  UpdateGuestSignalState(0);
+}
+
+void XEvent::WaitCallback() {
+  if (!manual_reset_) {
+    UpdateGuestSignalState(0);
+  }
+}
+
+void XEvent::UpdateGuestSignalState(uint32_t value) {
+  if (!guest_object()) {
+    return;
+  }
+  auto* header = guest_object<X_DISPATCH_HEADER>();
+  if (header) {
+    header->signal_state = value;
+  }
 }
 
 }  // namespace rex::system

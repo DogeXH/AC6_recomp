@@ -1,12 +1,22 @@
 /**
  * ReXGlue runtime - AC6 Recompilation project
  * Copyright (c) 2026 Tom Clay. All rights reserved.
+ * @modified    2026 - AC6 netplay: NetDll sockets routed to ac6net::vnet and XNet/QoS to
+ *              ac6net::Netplay when netplay is enabled (REX_HAVE_AC6NET). Parts of the QoS,
+ *              select and XNet behaviour follow Xenia Canary Netplay's xam_net.cc (BSD-3).
  */
 
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#ifndef REX_HAVE_AC6NET
+#define REX_HAVE_AC6NET 0
+#endif
+
+#include <algorithm>
+#include <map>
 #include <cstring>
+#include <vector>
 
 #include <rex/chrono/clock.h>
 #include <rex/kernel/xam/module.h>
@@ -20,6 +30,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xsocket.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
@@ -32,6 +43,21 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+#endif
+
+#if REX_HAVE_AC6NET
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include <ac6net/log.h>
+#include <ac6net/netplay.h>
+#include <ac6net/vnet.h>
+
+#include "netplay_net_marshal.h"
+#include "netplay_net_qos.h"
 #endif
 
 namespace rex {
@@ -172,6 +198,516 @@ struct XNetStartupParams {
 
 XNetStartupParams xnet_startup_params = {0};
 
+#if REX_HAVE_AC6NET
+//=============================================================================
+// AC6 netplay glue (ARCHITECTURE.md 5.4)
+//=============================================================================
+// With ac6net::Netplay enabled, every guest socket is a virtual ac6net::vnet socket with the
+// guest handle 0x1000 + id, and the XNet address/QoS calls go to ac6net::Netplay. With netplay
+// disabled, none of this runs and the XSocket path below behaves exactly as before.
+namespace {
+
+namespace np = netplay_net;
+namespace wsa = ac6net::wsa;
+using ac6net::Netplay;
+using ac6net::vnet::Endpoint;
+using ac6net::vnet::SocketId;
+
+bool NetplayOn() {
+  return Netplay::Get().enabled();
+}
+
+ac6net::vnet::VNet& Vnet() {
+  return Netplay::Get().vnet();
+}
+
+// Handles in the vnet range go to vnet only while netplay is on; otherwise they take the
+// XSocket path, which reports WSAENOTSOCK for them as it always did.
+bool IsVnetSocket(uint32_t handle) {
+  return np::IsVnetHandle(handle) && NetplayOn();
+}
+
+// Winsock-style failure: the WSA code goes to the calling guest thread's last error, which
+// NetDll_WSAGetLastError returns.
+int WsaFail(int err) {
+  if (!err) err = wsa::kInval;
+  // Trace every failure the guest sees except the routine WOULDBLOCK (at most 30 per code).
+  if (err != wsa::kWouldBlock && ac6net::TraceEnabled()) {
+    static std::mutex mu;
+    static std::map<int, int> counts;
+    std::lock_guard<std::mutex> lk(mu);
+    if (counts[err]++ < 30) {
+      ac6net::Trace("net.err", "\"err\":" + std::to_string(err));
+    }
+  }
+  XThread::SetLastError(static_cast<uint32_t>(err));
+  return -1;
+}
+
+int WsaResult(int ret, int err) {
+  return ret < 0 ? WsaFail(err) : ret;
+}
+
+uint8_t* GuestBytes(uint32_t guest_addr) {
+  return REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(guest_addr);
+}
+
+template <typename T>
+uint8_t* HostBytes(const ppc_ptr_t<T>& p) {
+  return reinterpret_cast<uint8_t*>(p.host_address());
+}
+
+template <typename T>
+bool GuestOk(const ppc_ptr_t<T>& p, uint64_t len) {
+  return p && np::GuestRangeOk(p.guest_address(), len);
+}
+
+// Reads a guest socket address argument (bind, connect, sendto). Returns a WSA code.
+template <typename T>
+int ReadSockaddrArg(const ppc_ptr_t<T>& p, uint32_t len, Endpoint* out) {
+  if (!GuestOk(p, np::kSockaddrInSize))
+    return wsa::kFault;
+  return np::ParseSockaddrIn(HostBytes(p), len, out);
+}
+
+// Validates an output socket address (accept, getsockname, getpeername, recvfrom) before the
+// operation runs, so a bad pointer never loses a connection or a datagram.
+template <typename T>
+int CheckSockaddrOutArg(const ppc_ptr_t<T>& addr, const ppc_pu32_t& len) {
+  if (len && !GuestOk(len, 4))
+    return wsa::kFault;
+  const uint32_t cap = len ? static_cast<uint32_t>(*len) : 0;
+  int err = np::CheckSockaddrOut(static_cast<bool>(addr), static_cast<bool>(len), cap);
+  if (err == wsa::kOk && addr && !GuestOk(addr, np::kSockaddrInSize))
+    err = wsa::kFault;
+  return err;
+}
+
+template <typename T>
+void WriteSockaddrOut(const ppc_ptr_t<T>& addr, const ppc_pu32_t& len, const Endpoint& ep) {
+  if (!addr)
+    return;
+  np::StoreSockaddrIn(HostBytes(addr), ep);
+  *len = np::kSockaddrInSize;
+}
+
+// Wraps a freshly created vnet socket id as a guest handle.
+u32 PublishSocket(SocketId id) {
+  const uint32_t handle = np::HandleFromId(id);
+  if (!handle) {
+    int ignored = wsa::kOk;
+    Vnet().Close(id, &ignored);
+    return static_cast<u32>(WsaFail(wsa::kNoBufs));
+  }
+  return handle;
+}
+
+// Return addresses of the calling guest code as a JSON array of hex strings: ctx.lr, then one
+// per frame of the r1 back chain (a frame's caller saved its LR at back_chain - 8). Diagnostics
+// for the traces only; stops at the first implausible frame. The walk stays inside the calling
+// thread's own guest stack (PCR stack_end..stack_base): the outermost frame's back chain points
+// at stack_base, and the page there is the stack's no-access guard page, so reading it faults.
+// (Windows build, 2026-10-23: the Main XThread died with an access violation at guest
+// 0x70210000 when the game closed a socket at mission start / session delete.)
+std::string GuestStackJson(int max_frames = 14) {
+  std::string out = "[";
+  if (!rex::runtime::ThreadState::Get())
+    return out + "]";
+  const PPCContext* ctx = rex::runtime::current_ppc_context();
+  char buf[16];
+  auto add = [&](uint32_t a) {
+    if (out.size() > 1)
+      out += ',';
+    std::snprintf(buf, sizeof(buf), "\"%08X\"", a);
+    out += buf;
+  };
+  add(static_cast<uint32_t>(ctx->lr));
+  uint32_t stack_lo = 0, stack_hi = 0;
+  if (XThread* thread = XThread::GetCurrentThread(); thread && thread->pcr_ptr() &&
+                                                     np::GuestRangeOk(thread->pcr_ptr(),
+                                                                      sizeof(X_KPCR))) {
+    const auto* pcr = reinterpret_cast<const X_KPCR*>(GuestBytes(thread->pcr_ptr()));
+    stack_hi = pcr->stack_base_ptr;
+    stack_lo = pcr->stack_end_ptr;
+  }
+  if (stack_hi <= stack_lo)
+    return out + "]";
+  // [a, a + n) inside the thread's stack.
+  auto in_stack = [&](uint32_t a, uint32_t n) {
+    return a >= stack_lo && a <= stack_hi && n <= stack_hi - a;
+  };
+  uint32_t sp = ctx->r1.u32;
+  for (int i = 0; i < max_frames; ++i) {
+    if (!in_stack(sp, 4))
+      break;
+    const uint32_t back = memory::load_and_swap<uint32_t>(GuestBytes(sp));
+    if (back <= sp || back - sp > 0x100000 || back < 8 || !in_stack(back - 8, 4))
+      break;
+    add(memory::load_and_swap<uint32_t>(GuestBytes(back - 8)));
+    sp = back;
+  }
+  return out + "]";
+}
+
+void TraceEvent(const char* event, const std::string& fields) {
+  if (ac6net::TraceEnabled())
+    ac6net::Trace(event, fields);
+}
+
+std::string IpField(const char* name, uint32_t ip) {
+  return std::string("\"") + name + "\":\"" + ac6net::Ipv4ToString(ip) + "\"";
+}
+
+// --- sockets ---------------------------------------------------------------
+
+u32 VnetSocket(u32 af, u32 type, u32 protocol) {
+  if (af != np::kAfInet)
+    return static_cast<u32>(WsaFail(wsa::kAfNoSupport));
+  int err = wsa::kOk;
+  const SocketId id = Vnet().Socket(static_cast<int>(type), static_cast<int>(protocol), &err);
+  if (id <= 0)
+    return static_cast<u32>(WsaFail(err ? err : wsa::kNoBufs));
+  return PublishSocket(id);
+}
+
+int VnetClose(u32 handle) {
+  int err = wsa::kOk;
+  return WsaResult(Vnet().Close(np::IdFromHandle(handle), &err), err);
+}
+
+int VnetShutdown(u32 handle, i32 how) {
+  int err = wsa::kOk;
+  return WsaResult(Vnet().Shutdown(np::IdFromHandle(handle), how, &err), err);
+}
+
+int VnetSetOption(u32 handle, u32 level, u32 option, const ppc_pvoid_t& value, u32 len) {
+  const int lvl = static_cast<int>(level);
+  const int opt = static_cast<int>(option);
+  if (np::IsIgnoredXboxOption(lvl, opt)) {
+    // There is no XNet security layer to opt out of; vnet traffic is protected by the overlay.
+    return Vnet().IsSocket(np::IdFromHandle(handle)) ? 0 : WsaFail(wsa::kNotSock);
+  }
+  if (len > np::kMaxOptionBytes)
+    return WsaFail(wsa::kInval);
+  if (len && !GuestOk(value, len))
+    return WsaFail(wsa::kFault);
+  uint8_t host[np::kMaxOptionBytes] = {};
+  if (len)
+    np::SwapOptionValue(lvl, opt, HostBytes(value), host, len, /*guest_to_host=*/true);
+  int err = wsa::kOk;
+  return WsaResult(Vnet().SetOption(np::IdFromHandle(handle), lvl, opt, host, len, &err), err);
+}
+
+int VnetGetOption(u32 handle, u32 level, u32 option, const ppc_pvoid_t& value,
+                  const ppc_pu32_t& len_ptr) {
+  if (!GuestOk(len_ptr, 4))
+    return WsaFail(wsa::kFault);
+  const uint32_t cap = std::min<uint32_t>(*len_ptr, np::kMaxOptionBytes);
+  if (!GuestOk(value, cap ? cap : 1))
+    return WsaFail(wsa::kFault);
+  const int lvl = static_cast<int>(level);
+  const int opt = static_cast<int>(option);
+  uint8_t host[np::kMaxOptionBytes] = {};
+  size_t len = cap;
+  int err = wsa::kOk;
+  const int ret = Vnet().GetOption(np::IdFromHandle(handle), lvl, opt, host, &len, &err);
+  if (ret < 0)
+    return WsaFail(err);
+  len = std::min<size_t>(len, cap);
+  np::SwapOptionValue(lvl, opt, host, HostBytes(value), len, /*guest_to_host=*/false);
+  *len_ptr = static_cast<uint32_t>(len);
+  return 0;
+}
+
+int VnetIoctl(u32 handle, u32 cmd, const ppc_pvoid_t& arg) {
+  if (!GuestOk(arg, 4))
+    return WsaFail(wsa::kFault);
+  const SocketId id = np::IdFromHandle(handle);
+  int err = wsa::kOk;
+  switch (cmd) {
+    case np::kFionbio: {
+      const bool non_blocking = np::LoadBe32(HostBytes(arg)) != 0;
+      return WsaResult(Vnet().SetNonBlocking(id, non_blocking, &err), err);
+    }
+    case np::kFionread: {
+      uint32_t available = 0;
+      const int ret = Vnet().Available(id, &available, &err);
+      if (ret < 0)
+        return WsaFail(err);
+      np::StoreBe32(HostBytes(arg), available);
+      return 0;
+    }
+    default:
+      REXKRNL_WARN("NetDll_ioctlsocket: unsupported command {:08X} on a netplay socket", cmd);
+      return WsaFail(wsa::kInval);
+  }
+}
+
+int VnetBind(u32 handle, const ppc_ptr_t<XSOCKADDR_IN>& name, u32 name_len) {
+  Endpoint local;
+  const int perr = ReadSockaddrArg(name, name_len, &local);
+  if (perr != wsa::kOk)
+    return WsaFail(perr);
+  int err = wsa::kOk;
+  return WsaResult(Vnet().Bind(np::IdFromHandle(handle), local, &err), err);
+}
+
+int VnetConnect(u32 handle, const ppc_ptr_t<XSOCKADDR>& name, u32 name_len) {
+  Endpoint remote;
+  const int perr = ReadSockaddrArg(name, name_len, &remote);
+  if (perr != wsa::kOk)
+    return WsaFail(perr);
+  int err = wsa::kOk;
+  return WsaResult(Vnet().Connect(np::IdFromHandle(handle), remote, &err), err);
+}
+
+int VnetListen(u32 handle, i32 backlog) {
+  int err = wsa::kOk;
+  return WsaResult(Vnet().Listen(np::IdFromHandle(handle), backlog, &err), err);
+}
+
+u32 VnetAccept(u32 handle, const ppc_ptr_t<XSOCKADDR>& addr, const ppc_pu32_t& addr_len) {
+  const int cerr = CheckSockaddrOutArg(addr, addr_len);
+  if (cerr != wsa::kOk)
+    return static_cast<u32>(WsaFail(cerr));
+  Endpoint remote;
+  int err = wsa::kOk;
+  const SocketId id = Vnet().Accept(np::IdFromHandle(handle), &remote, &err);
+  if (id <= 0)
+    return static_cast<u32>(WsaFail(err));
+  const u32 new_handle = PublishSocket(id);
+  if (new_handle != static_cast<u32>(-1))
+    WriteSockaddrOut(addr, addr_len, remote);
+  return new_handle;
+}
+
+int VnetRecv(u32 handle, const ppc_pvoid_t& buf, u32 len, u32 flags) {
+  if (len && !GuestOk(buf, len))
+    return WsaFail(wsa::kFault);
+  int err = wsa::kOk;
+  return WsaResult(
+      Vnet().Recv(np::IdFromHandle(handle), buf.host_address(), len, static_cast<int>(flags), &err),
+      err);
+}
+
+int VnetRecvFrom(u32 handle, const ppc_pvoid_t& buf, u32 len, u32 flags,
+                 const ppc_ptr_t<XSOCKADDR_IN>& from, const ppc_pu32_t& from_len) {
+  if (len && !GuestOk(buf, len))
+    return WsaFail(wsa::kFault);
+  const int cerr = CheckSockaddrOutArg(from, from_len);
+  if (cerr != wsa::kOk)
+    return WsaFail(cerr);
+  Endpoint source;
+  int err = wsa::kOk;
+  const int ret = Vnet().RecvFrom(np::IdFromHandle(handle), buf.host_address(), len,
+                                  static_cast<int>(flags), &source, &err);
+  if (ret < 0)
+    return WsaFail(err);
+  WriteSockaddrOut(from, from_len, source);
+  return ret;
+}
+
+int VnetSend(u32 handle, const void* data, u32 len, u32 flags) {
+  int err = wsa::kOk;
+  return WsaResult(Vnet().Send(np::IdFromHandle(handle), data, len, static_cast<int>(flags), &err),
+                   err);
+}
+
+template <typename T>
+int VnetSendTo(u32 handle, const void* data, u32 len, u32 flags, const ppc_ptr_t<T>& to,
+               u32 to_len) {
+  if (!to)
+    return VnetSend(handle, data, len, flags);  // connected socket
+  Endpoint remote;
+  const int perr = ReadSockaddrArg(to, to_len, &remote);
+  if (perr != wsa::kOk)
+    return WsaFail(perr);
+  int err = wsa::kOk;
+  return WsaResult(
+      Vnet().SendTo(np::IdFromHandle(handle), data, len, static_cast<int>(flags), remote, &err),
+      err);
+}
+
+template <typename T>
+int VnetGetName(u32 handle, const ppc_ptr_t<T>& addr, const ppc_pu32_t& addr_len, bool peer) {
+  if (!addr || !addr_len)
+    return WsaFail(wsa::kFault);
+  const int cerr = CheckSockaddrOutArg(addr, addr_len);
+  if (cerr != wsa::kOk)
+    return WsaFail(cerr);
+  Endpoint ep;
+  int err = wsa::kOk;
+  const SocketId id = np::IdFromHandle(handle);
+  const int ret = peer ? Vnet().GetPeerName(id, &ep, &err) : Vnet().GetSockName(id, &ep, &err);
+  if (ret < 0)
+    return WsaFail(err);
+  WriteSockaddrOut(addr, addr_len, ep);
+  return 0;
+}
+
+// WSABUF arrays (WSASendTo / WSARecvFrom). Overlapped I/O is not supported on vnet sockets.
+constexpr uint32_t kMaxWsaBuffers = 64;
+constexpr uint64_t kMaxWsaBytes = 1u << 20;
+
+struct GuestBuffer {
+  uint8_t* data;
+  uint32_t len;
+};
+
+int ReadWsaBuffers(const ppc_ptr_t<XWSABUF>& buffers, u32 count, std::vector<GuestBuffer>* out,
+                   uint64_t* total) {
+  out->clear();
+  *total = 0;
+  if (count > kMaxWsaBuffers)
+    return wsa::kInval;
+  if (count && !GuestOk(buffers, uint64_t{count} * sizeof(XWSABUF)))
+    return wsa::kFault;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t len = buffers[i].len;
+    const uint32_t ptr = buffers[i].buf_ptr;
+    if (!np::GuestRangeOk(ptr, len))
+      return wsa::kFault;
+    *total += len;
+    if (*total > kMaxWsaBytes)
+      return wsa::kNoBufs;
+    out->push_back({len ? GuestBytes(ptr) : nullptr, len});
+  }
+  return wsa::kOk;
+}
+
+u32 VnetWsaSendTo(u32 handle, const ppc_ptr_t<XWSABUF>& buffers, u32 count,
+                  const ppc_pu32_t& bytes_sent, u32 flags, const ppc_ptr_t<XSOCKADDR_IN>& to,
+                  u32 to_len, bool overlapped) {
+  if (overlapped)
+    return static_cast<u32>(WsaFail(wsa::kOpNotSupp));
+  std::vector<GuestBuffer> parts;
+  uint64_t total = 0;
+  const int berr = ReadWsaBuffers(buffers, count, &parts, &total);
+  if (berr != wsa::kOk)
+    return static_cast<u32>(WsaFail(berr));
+  std::vector<uint8_t> combined;
+  combined.reserve(static_cast<size_t>(total));
+  for (const GuestBuffer& part : parts) {
+    combined.insert(combined.end(), part.data, part.data + part.len);
+  }
+  const int ret =
+      VnetSendTo(handle, combined.data(), static_cast<u32>(combined.size()), flags, to, to_len);
+  if (ret < 0)
+    return static_cast<u32>(-1);
+  if (GuestOk(bytes_sent, 4))
+    *bytes_sent = static_cast<uint32_t>(ret);
+  return 0;
+}
+
+u32 VnetWsaRecvFrom(u32 handle, const ppc_ptr_t<XWSABUF>& buffers, u32 count,
+                    const ppc_pu32_t& bytes_recv, const ppc_pu32_t& flags_ptr,
+                    const ppc_ptr_t<XSOCKADDR_IN>& from, const ppc_pu32_t& from_len,
+                    bool overlapped) {
+  if (overlapped)
+    return static_cast<u32>(WsaFail(wsa::kOpNotSupp));
+  std::vector<GuestBuffer> parts;
+  uint64_t total = 0;
+  const int berr = ReadWsaBuffers(buffers, count, &parts, &total);
+  if (berr != wsa::kOk)
+    return static_cast<u32>(WsaFail(berr));
+  if (flags_ptr && !GuestOk(flags_ptr, 4))
+    return static_cast<u32>(WsaFail(wsa::kFault));
+  const int cerr = CheckSockaddrOutArg(from, from_len);
+  if (cerr != wsa::kOk)
+    return static_cast<u32>(WsaFail(cerr));
+  const int flags = flags_ptr ? static_cast<int>(static_cast<uint32_t>(*flags_ptr)) : 0;
+  std::vector<uint8_t> staging(static_cast<size_t>(total));
+  Endpoint source;
+  int err = wsa::kOk;
+  const int ret = Vnet().RecvFrom(np::IdFromHandle(handle), staging.data(), staging.size(), flags,
+                                  &source, &err);
+  if (ret < 0)
+    return static_cast<u32>(WsaFail(err));
+  size_t offset = 0;
+  for (const GuestBuffer& part : parts) {
+    if (offset >= static_cast<size_t>(ret))
+      break;
+    const size_t n = std::min<size_t>(part.len, static_cast<size_t>(ret) - offset);
+    std::memcpy(part.data, staging.data() + offset, n);
+    offset += n;
+  }
+  WriteSockaddrOut(from, from_len, source);
+  if (GuestOk(bytes_recv, 4))
+    *bytes_recv = static_cast<uint32_t>(ret);
+  if (flags_ptr)
+    *flags_ptr = 0u;
+  return 0;
+}
+
+// --- QoS -------------------------------------------------------------------
+
+class KernelGuestHeap final : public np::GuestHeap {
+ public:
+  uint32_t Alloc(uint32_t size) override { return REX_KERNEL_MEMORY()->SystemHeapAlloc(size); }
+  void Free(uint32_t guest_addr) override { REX_KERNEL_MEMORY()->SystemHeapFree(guest_addr); }
+  uint8_t* Translate(uint32_t guest_addr) override { return GuestBytes(guest_addr); }
+};
+
+KernelGuestHeap g_guest_heap;
+
+// Live XNQOS blocks handed out by XNetQosLookup / XNetQosServiceLookup, by guest address.
+// Only guest threads take this lock; the network thread touches QosResults objects only.
+std::mutex g_qos_mutex;
+std::unordered_map<uint32_t, std::shared_ptr<np::QosResults>> g_qos_results;
+
+void SignalGuestEvent(uint32_t event_handle) {
+  if (!event_handle)
+    return;
+  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+  if (ev)
+    ev->Set(0, false);
+}
+
+std::shared_ptr<np::QosResults> NewQosResults(uint32_t count, uint32_t targets,
+                                              uint32_t event_handle) {
+  const uint32_t addr = g_guest_heap.Alloc(np::XnQosBytes(count));
+  if (!addr)
+    return nullptr;
+  np::QosResults::Signal signal;
+  if (event_handle)
+    signal = [event_handle] { SignalGuestEvent(event_handle); };
+  auto results =
+      std::make_shared<np::QosResults>(&g_guest_heap, addr, count, targets, std::move(signal));
+  results->Init();
+  std::lock_guard<std::mutex> lock(g_qos_mutex);
+  g_qos_results[addr] = results;
+  return results;
+}
+
+// Stops the lookup, then frees the XNQOS and every data blob it points to. No glue lock is
+// held while the core is called.
+void ReleaseQosResults(const std::shared_ptr<np::QosResults>& results) {
+  const uint64_t lookup_id = results->lookup_id();
+  const std::vector<uint32_t> allocations = results->Release();
+  if (lookup_id)
+    Netplay::Get().QosCancel(lookup_id);
+  for (uint32_t addr : allocations)
+    g_guest_heap.Free(addr);
+}
+
+std::shared_ptr<np::QosResults> TakeQosResults(uint32_t addr) {
+  std::lock_guard<std::mutex> lock(g_qos_mutex);
+  auto it = g_qos_results.find(addr);
+  if (it == g_qos_results.end())
+    return nullptr;
+  auto results = std::move(it->second);
+  g_qos_results.erase(it);
+  return results;
+}
+
+uint32_t QosDataLimit() {
+  const uint32_t div4 = xnet_startup_params.cfgQosDataLimitDiv4;
+  return div4 ? div4 * 4 : 256;  // XDK default cfgQosDataLimitDiv4 = 64
+}
+
+}  // namespace
+#endif  // REX_HAVE_AC6NET
+
 ppc_u32_result_t NetDll_XNetStartup_entry(ppc_u32_t caller, ppc_ptr_t<XNetStartupParams> params) {
   if (params) {
     assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
@@ -222,6 +758,16 @@ ppc_u32_result_t NetDll_XNetGetOpt_entry(ppc_u32_t one, ppc_u32_t option_id, ppc
 
 ppc_u32_result_t NetDll_XNetRandom_entry(ppc_u32_t caller, ppc_pvoid_t buffer_ptr,
                                          ppc_u32_t length) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (!length)
+      return 0;
+    if (!GuestOk(buffer_ptr, length))
+      return wsa::kFault;
+    Netplay::Get().Random(HostBytes(buffer_ptr), length);
+    return 0;
+  }
+#endif
   // For now, constant values.
   // This makes replicating things easier.
   std::memset(buffer_ptr, 0xBB, length);
@@ -287,12 +833,21 @@ ppc_u32_result_t NetDll_WSAGetLastError_entry() {
   return XThread::GetLastError();
 }
 
+// WSARecvFrom(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpFrom, lpFromlen,
+// lpOverlapped, lpCompletionRoutine). The fromlen argument was missing from the original
+// signature; the XSocket path ignores every argument, so adding it changes nothing there.
 ppc_u32_result_t NetDll_WSARecvFrom_entry(ppc_u32_t caller, ppc_u32_t socket,
                                           ppc_ptr_t<XWSABUF> buffers_ptr, ppc_u32_t buffer_count,
                                           ppc_pu32_t num_bytes_recv, ppc_pu32_t flags_ptr,
-                                          ppc_ptr_t<XSOCKADDR_IN> from_addr,
+                                          ppc_ptr_t<XSOCKADDR_IN> from_addr, ppc_pu32_t fromlen_ptr,
                                           ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
                                           ppc_pvoid_t completion_routine_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket)) {
+    return VnetWsaRecvFrom(socket, buffers_ptr, buffer_count, num_bytes_recv, flags_ptr, from_addr,
+                           fromlen_ptr, overlapped_ptr || completion_routine_ptr);
+  }
+#endif
   if (overlapped_ptr) {
     // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
     //    overlapped_ptr->event_handle);
@@ -315,6 +870,12 @@ ppc_u32_result_t NetDll_WSASendTo_entry(ppc_u32_t caller, ppc_u32_t socket_handl
                                         ppc_ptr_t<XSOCKADDR_IN> to_ptr, ppc_u32_t to_len,
                                         ppc_ptr_t<XWSAOVERLAPPED> overlapped,
                                         ppc_pvoid_t completion_routine) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return VnetWsaSendTo(socket_handle, buffers, num_buffers, num_bytes_sent, flags, to_ptr, to_len,
+                         overlapped || completion_routine);
+  }
+#endif
   assert(!overlapped);
   assert(!completion_routine);
 
@@ -432,6 +993,38 @@ struct XnAddrStatus {
 };
 
 ppc_u32_result_t NetDll_XNetGetTitleXnAddr_entry(ppc_u32_t caller, ppc_ptr_t<XNADDR> addr_ptr) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    // AC6 busy-waits on the game thread while this returns PENDING, so it never does. The
+    // first call gives a first-ever registration a bounded chance to finish.
+    Netplay& netplay = Netplay::Get();
+    static std::once_flag first_call;
+    std::call_once(first_call,
+                   [&netplay] { netplay.WaitRegistered(netplay.config().first_connect_wait_ms); });
+    const ac6net::Identity identity = netplay.identity();
+    const ac6net::XnAddr xnaddr = netplay.LocalXnAddr();
+    if (GuestOk(addr_ptr, np::kXnAddrSize))
+      np::WriteXnAddr(HostBytes(addr_ptr), xnaddr);
+    uint32_t status = np::kXnAddrStatusOffline;  // loopback XNADDR, no identity yet
+    if (identity.valid && identity.vip) {
+      // XNADDR from ARCHITECTURE.md section 3. It stays the same while the server is
+      // unreachable; only the ONLINE bit tracks the connection.
+      status = netplay.state() == ac6net::NetState::kOffline
+                   ? (np::kXnAddrStatusOnline & ~np::kXnAddrOnline)
+                   : np::kXnAddrStatusOnline;
+    }
+    // Report changes only: the game calls this from several places.
+    static std::atomic<uint64_t> last_reported{~uint64_t{0}};
+    const uint64_t report = (uint64_t{xnaddr.ina} << 32) | status;
+    if (last_reported.exchange(report) != report) {
+      REXKRNL_INFO("XNetGetTitleXnAddr: netplay {} (status {:02X})",
+                   ac6net::Ipv4ToString(xnaddr.ina), status);
+      TraceEvent("xnet.title_xnaddr",
+                 IpField("ina", xnaddr.ina) + ",\"status\":" + std::to_string(status));
+    }
+    return status;
+  }
+#endif
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -477,13 +1070,62 @@ void NetDll_XNetInAddrToString_entry(ppc_u32_t caller, ppc_u32_t in_addr, ppc_pc
 // subsequent socket calls (like a handle to a XNet address)
 ppc_u32_result_t NetDll_XNetXnAddrToInAddr_entry(ppc_u32_t caller, ppc_ptr_t<XNADDR> xn_addr,
                                                  ppc_pvoid_t xid, ppc_pvoid_t in_addr) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (!GuestOk(xn_addr, np::kXnAddrSize) || !GuestOk(in_addr, 4))
+      return wsa::kInval;
+    if (xid && !GuestOk(xid, np::kXnKidSize))
+      return wsa::kInval;
+    const ac6net::XnAddr addr = np::ReadXnAddr(HostBytes(xn_addr));
+    ac6net::XnKid kid;
+    if (xid)
+      kid = np::ReadXnKid(HostBytes(xid));
+    uint32_t vip = 0;
+    const int err = Netplay::Get().XnAddrToInAddr(addr, xid ? &kid : nullptr, &vip);
+    TraceEvent("xnet.xnaddr_to_inaddr", IpField("ina_online", addr.ina_online) + "," +
+                                            IpField("vip", vip) +
+                                            ",\"err\":" + std::to_string(err));
+    if (err != wsa::kOk) {
+      REXKRNL_WARN("XNetXnAddrToInAddr: {} not resolvable ({})",
+                   ac6net::Ipv4ToString(addr.ina_online ? addr.ina_online : addr.ina), err);
+      return static_cast<u32>(err);
+    }
+    np::StoreBe32(HostBytes(in_addr), vip);  // IN_ADDR: network order == big-endian
+    return 0;
+  }
+#endif
   return 1;
 }
 
-// Does the reverse of the above.
-// FIXME: Arguments may not be correct.
-ppc_u32_result_t NetDll_XNetInAddrToXnAddr_entry(ppc_u32_t caller, ppc_pvoid_t in_addr,
+// Does the reverse of the above: XNetInAddrToXnAddr(const IN_ADDR ina, XNADDR* pxna,
+// XNKID* pxnkid). The 4-byte IN_ADDR is passed by value, so the register already holds the
+// address in host numeric form (10.64.0.7 == 0x0A400007).
+ppc_u32_result_t NetDll_XNetInAddrToXnAddr_entry(ppc_u32_t caller, ppc_u32_t in_addr,
                                                  ppc_ptr_t<XNADDR> xn_addr, ppc_pvoid_t xid) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (xn_addr && !GuestOk(xn_addr, np::kXnAddrSize))
+      return wsa::kInval;
+    if (xid && !GuestOk(xid, np::kXnKidSize))
+      return wsa::kInval;
+    ac6net::XnAddr addr;
+    ac6net::XnKid kid;
+    const int err = Netplay::Get().InAddrToXnAddr(in_addr, &addr, &kid);
+    TraceEvent("xnet.inaddr_to_xnaddr",
+               IpField("vip", in_addr) + ",\"err\":" + std::to_string(err));
+    if (err != wsa::kOk) {
+      if (xn_addr)
+        xn_addr.Zero();
+      REXKRNL_WARN("XNetInAddrToXnAddr: {} unknown ({})", ac6net::Ipv4ToString(in_addr), err);
+      return static_cast<u32>(err);
+    }
+    if (xn_addr)
+      np::WriteXnAddr(HostBytes(xn_addr), addr);
+    if (xid)
+      np::WriteXnKid(HostBytes(xid), kid);
+    return 0;
+  }
+#endif
   return 1;
 }
 
@@ -533,6 +1175,23 @@ ppc_u32_result_t NetDll_XNetDnsRelease_entry(ppc_u32_t caller, ppc_ptr_t<XNDNS> 
 
 ppc_u32_result_t NetDll_XNetQosServiceLookup_entry(ppc_u32_t caller, ppc_u32_t flags,
                                                    ppc_u32_t event_handle, ppc_pu32_t pqos) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (!GuestOk(pqos, 4))
+      return wsa::kInval;
+    auto results = NewQosResults(1, 1, event_handle);
+    if (!results)
+      return wsa::kNoBufs;
+    *pqos = results->guest_address();
+    uint32_t rtt_ms = 0, up_bps = 0, dn_bps = 0;
+    const bool ok = Netplay::Get().QosServiceLookup(&rtt_ms, &up_bps, &dn_bps);
+    // One completed entry; the nominal 10 Mbit/s (when the core reports none) gives tier 5.
+    results->OnResult(0, np::MakeServiceResult(ok, rtt_ms, up_bps, dn_bps), true);
+    TraceEvent("qos.service_lookup", std::string("\"ok\":") + (ok ? "true" : "false") +
+                                         ",\"rtt_ms\":" + std::to_string(rtt_ms));
+    return 0;
+  }
+#endif
   // Set pqos as some games will try accessing it despite non-successful result
   if (pqos) {
     auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
@@ -552,13 +1211,165 @@ ppc_u32_result_t NetDll_XNetQosRelease_entry(ppc_u32_t caller, ppc_ptr_t<XNQOS> 
   if (!qos) {
     return X_STATUS_INVALID_PARAMETER;
   }
+#if REX_HAVE_AC6NET
+  if (auto results = TakeQosResults(qos.guest_address())) {
+    ReleaseQosResults(results);  // cancels the lookup, frees the XNQOS and its data blobs
+    return 0;
+  }
+  if (NetplayOn()) {
+    // Not one of ours (or already released): freeing it could corrupt the heap.
+    REXKRNL_WARN("XNetQosRelease: unknown or already released XNQOS {:08X}", qos.guest_address());
+    return 0;
+  }
+#endif
   REX_KERNEL_MEMORY()->SystemHeapFree(qos.guest_address());
   return 0;
 }
 
+// XNetQosListen(const XNKID* pxnkid, const BYTE* pb, UINT cb, DWORD dwBitsPerSec,
+//               DWORD dwFlags)
 ppc_u32_result_t NetDll_XNetQosListen_entry(ppc_u32_t caller, ppc_pvoid_t id, ppc_pvoid_t data,
                                             ppc_u32_t data_size, ppc_u32_t r7, ppc_u32_t flags) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (!GuestOk(id, np::kXnKidSize))
+      return wsa::kInval;
+    const ac6net::XnKid kid = np::ReadXnKid(HostBytes(id));
+    const uint8_t* bytes = nullptr;
+    size_t len = 0;
+    if (data && data_size) {
+      if (data_size > QosDataLimit())
+        return wsa::kMsgSize;
+      if (!GuestOk(data, data_size))
+        return wsa::kFault;
+      bytes = HostBytes(data);
+      len = data_size;
+    }
+    Netplay::Get().QosListen(kid, bytes, len, r7, flags);
+    TraceEvent("qos.listen", "\"xnkid\":\"" + ac6net::HexEncode(kid.b.data(), kid.b.size()) +
+                                 "\",\"len\":" + std::to_string(len) +
+                                 ",\"flags\":" + std::to_string(flags));
+    return 0;
+  }
+#endif
   return X_ERROR_FUNCTION_FAILED;
+}
+
+// XNetQosLookup(UINT cxna, const XNADDR* apxna[], const XNKID* apxnkid[],
+//               const XNKEY* apxnkey[], UINT cina, const IN_ADDR aina[],
+//               const DWORD adwServiceId[], UINT cProbes, DWORD dwBitsPerSec, DWORD dwFlags,
+//               WSAEVENT hEvent, XNQOS** ppxnqos)
+// The XNQOS is handed back at once with cxnqosPending = cxna; the ac6net callback fills each
+// entry (network thread) and drops cxnqosPending to 0 when all are done.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 num_remote, u32 xnaddr_ptrs, u32 xnkid_ptrs,
+                               u32 xnkey_ptrs, u32 num_gateways, u32 gateway_addrs, u32 service_ids,
+                               u32 num_probes, u32 bits_per_sec, u32 flags, u32 event_handle,
+                               ppc_pu32_t pxnqos) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (!GuestOk(pxnqos, 4))
+      return wsa::kInval;
+    const uint64_t count = uint64_t{num_remote} + num_gateways;
+    if (count == 0 || count > np::kMaxQosEntries)
+      return wsa::kInval;
+    if (num_remote && !np::GuestRangeOk(xnaddr_ptrs, uint64_t{num_remote} * 4)) {
+      return wsa::kInval;
+    }
+    if (xnkid_ptrs && !np::GuestRangeOk(xnkid_ptrs, uint64_t{num_remote} * 4)) {
+      return wsa::kInval;
+    }
+
+    // Unreadable entries become zero addresses, which the core completes without contact.
+    std::vector<ac6net::XnAddr> addrs(num_remote);
+    std::vector<ac6net::XnKid> kids(num_remote);
+    for (uint32_t i = 0; i < num_remote; ++i) {
+      const uint32_t addr_ptr = np::LoadBe32(GuestBytes(xnaddr_ptrs + 4 * i));
+      if (np::GuestRangeOk(addr_ptr, np::kXnAddrSize) && addr_ptr) {
+        addrs[i] = np::ReadXnAddr(GuestBytes(addr_ptr));
+      }
+      if (xnkid_ptrs) {
+        const uint32_t kid_ptr = np::LoadBe32(GuestBytes(xnkid_ptrs + 4 * i));
+        if (np::GuestRangeOk(kid_ptr, np::kXnKidSize) && kid_ptr) {
+          kids[i] = np::ReadXnKid(GuestBytes(kid_ptr));
+        }
+      }
+    }
+
+    auto results = NewQosResults(static_cast<uint32_t>(count), num_remote, event_handle);
+    if (!results)
+      return wsa::kNoBufs;
+    *pxnqos = results->guest_address();
+    if (num_gateways) {
+      REXKRNL_WARN("XNetQosLookup: {} security gateway target(s) not supported", num_gateways);
+    }
+    if (!num_remote) {
+      // Only gateway entries, all complete already.
+      SignalGuestEvent(event_handle);
+      return 0;
+    }
+
+    // With no probes the lookup still needs one round trip to fetch the listener's data.
+    const uint32_t probes = std::clamp<uint32_t>(num_probes, 1, np::kMaxQosProbes);
+    const uint64_t lookup_id = Netplay::Get().QosLookup(
+        addrs, kids, probes,
+        [results](size_t index, const ac6net::QosTargetResult& r, bool all_done) {
+          results->OnResult(index, r, all_done);
+          if (all_done) {
+            TraceEvent("qos.lookup.done", std::string("\"contacted\":") +
+                                              (r.contacted ? "true" : "false") +
+                                              ",\"data\":" + std::to_string(r.data.size()) +
+                                              ",\"rtt_med_ms\":" + std::to_string(r.rtt_med_ms));
+          }
+        });
+    if (!lookup_id) {
+      TakeQosResults(results->guest_address());
+      ReleaseQosResults(results);
+      *pxnqos = 0u;
+      REXKRNL_WARN("XNetQosLookup: core refused the lookup");
+      return wsa::kNetDown;
+    }
+    results->set_lookup_id(lookup_id);
+    TraceEvent("qos.lookup.start", IpField("target", addrs[0].ina_online) +
+                                       ",\"n\":" + std::to_string(num_remote) +
+                                       ",\"probes\":" + std::to_string(probes));
+    return 0;
+  }
+#endif
+  REXKRNL_WARN("{} STUB", "__imp__NetDll_XNetQosLookup");
+  return caller;  // the former REX_EXPORT_STUB left r3 (= caller) as the return value
+}
+
+// XNetCreateKey(XNKID* pxnkid, XNKEY* pxnkey): random system-link XNKID (type byte 0x00) and
+// a random key, as Xenia's GenerateSessionId(XNKID_SYSTEM_LINK).
+u32 NetDll_XNetCreateKey_entry(u32 caller, ppc_pvoid_t xnkid, ppc_pvoid_t xnkey) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn()) {
+    if (!GuestOk(xnkid, np::kXnKidSize) || !GuestOk(xnkey, np::kXnKeySize)) {
+      return wsa::kInval;
+    }
+    ac6net::XnKid kid;
+    ac6net::XnKey key;
+    Netplay::Get().Random(kid.b.data(), kid.b.size());
+    Netplay::Get().Random(key.b.data(), key.b.size());
+    np::MakeSystemLinkKid(&kid);
+    np::WriteXnKid(HostBytes(xnkid), kid);
+    std::memcpy(HostBytes(xnkey), key.b.data(), key.b.size());
+    return 0;
+  }
+#endif
+  REXKRNL_WARN("{} STUB", "__imp__NetDll_XNetCreateKey");
+  return caller;  // the former REX_EXPORT_STUB left r3 (= caller) as the return value
+}
+
+// XNetRegisterKey(const XNKID*, const XNKEY*): nothing to register, vnet has no security
+// associations.
+u32 NetDll_XNetRegisterKey_entry(u32 caller, ppc_pvoid_t xnkid, ppc_pvoid_t xnkey) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn())
+    return 0;
+#endif
+  REXKRNL_WARN("{} STUB", "__imp__NetDll_XNetRegisterKey");
+  return caller;  // the former REX_EXPORT_STUB left r3 (= caller) as the return value
 }
 
 ppc_u32_result_t NetDll_inet_addr_entry(ppc_pchar_t addr_ptr) {
@@ -579,6 +1390,10 @@ ppc_u32_result_t NetDll_inet_addr_entry(ppc_pchar_t addr_ptr) {
 
 ppc_u32_result_t NetDll_socket_entry(ppc_u32_t caller, ppc_u32_t af, ppc_u32_t type,
                                      ppc_u32_t protocol) {
+#if REX_HAVE_AC6NET
+  if (NetplayOn())
+    return VnetSocket(af, type, protocol);
+#endif
   XSocket* socket = new XSocket(REX_KERNEL_STATE());
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
@@ -596,6 +1411,14 @@ ppc_u32_result_t NetDll_socket_entry(ppc_u32_t caller, ppc_u32_t af, ppc_u32_t t
 }
 
 ppc_u32_result_t NetDll_closesocket_entry(ppc_u32_t caller, ppc_u32_t socket_handle) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    if (ac6net::TraceEnabled())  // the stack walk only feeds the trace
+      TraceEvent("net.close", "\"h\":" + std::to_string(uint32_t(socket_handle)) +
+                                  ",\"stack\":" + GuestStackJson());
+    return static_cast<u32>(VnetClose(socket_handle));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -611,6 +1434,15 @@ ppc_u32_result_t NetDll_closesocket_entry(ppc_u32_t caller, ppc_u32_t socket_han
 }
 
 ppc_i32_result_t NetDll_shutdown_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_i32_t how) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    if (ac6net::TraceEnabled())  // the stack walk only feeds the trace
+      TraceEvent("net.shutdown", "\"h\":" + std::to_string(uint32_t(socket_handle)) +
+                                     ",\"how\":" + std::to_string(int32_t(how)) +
+                                     ",\"stack\":" + GuestStackJson());
+    return VnetShutdown(socket_handle, how);
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -633,6 +1465,11 @@ ppc_i32_result_t NetDll_shutdown_entry(ppc_u32_t caller, ppc_u32_t socket_handle
 ppc_u32_result_t NetDll_setsockopt_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_u32_t level,
                                          ppc_u32_t optname, ppc_pvoid_t optval_ptr,
                                          ppc_u32_t optlen) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(VnetSetOption(socket_handle, level, optname, optval_ptr, optlen));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -646,6 +1483,10 @@ ppc_u32_result_t NetDll_setsockopt_entry(ppc_u32_t caller, ppc_u32_t socket_hand
 
 ppc_u32_result_t NetDll_ioctlsocket_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_u32_t cmd,
                                           ppc_pvoid_t arg_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle))
+    return static_cast<u32>(VnetIoctl(socket_handle, cmd, arg_ptr));
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -665,6 +1506,10 @@ ppc_u32_result_t NetDll_ioctlsocket_entry(ppc_u32_t caller, ppc_u32_t socket_han
 
 ppc_u32_result_t NetDll_bind_entry(ppc_u32_t caller, ppc_u32_t socket_handle,
                                    ppc_ptr_t<XSOCKADDR_IN> name, ppc_u32_t namelen) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle))
+    return static_cast<u32>(VnetBind(socket_handle, name, namelen));
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -684,6 +1529,11 @@ ppc_u32_result_t NetDll_bind_entry(ppc_u32_t caller, ppc_u32_t socket_handle,
 
 ppc_u32_result_t NetDll_connect_entry(ppc_u32_t caller, ppc_u32_t socket_handle,
                                       ppc_ptr_t<XSOCKADDR> name, ppc_u32_t namelen) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(VnetConnect(socket_handle, name, namelen));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -702,6 +1552,10 @@ ppc_u32_result_t NetDll_connect_entry(ppc_u32_t caller, ppc_u32_t socket_handle,
 }
 
 ppc_u32_result_t NetDll_listen_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_i32_t backlog) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle))
+    return static_cast<u32>(VnetListen(socket_handle, backlog));
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -720,6 +1574,10 @@ ppc_u32_result_t NetDll_listen_entry(ppc_u32_t caller, ppc_u32_t socket_handle, 
 
 ppc_u32_result_t NetDll_accept_entry(ppc_u32_t caller, ppc_u32_t socket_handle,
                                      ppc_ptr_t<XSOCKADDR> addr_ptr, ppc_pu32_t addrlen_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle))
+    return VnetAccept(socket_handle, addr_ptr, addrlen_ptr);
+#endif
   if (!addr_ptr) {
     // WSAEFAULT
     XThread::SetLastError(0x271E);
@@ -799,9 +1657,83 @@ struct host_set {
   }
 };
 
+#if REX_HAVE_AC6NET
+namespace {
+
+// select on vnet sockets: read/write/except x_fd_sets, guest nfds ignored, timeval* NULL =
+// infinite, sets rewritten to their ready members. Returns false, without touching anything,
+// when the call belongs to the XSocket path (netplay off, or only XSocket handles).
+bool TryVnetSelect(ppc_ptr_t<x_fd_set> readfds, ppc_ptr_t<x_fd_set> writefds,
+                   ppc_ptr_t<x_fd_set> exceptfds, const ppc_pvoid_t& timeout_ptr, i32* result) {
+  if (!NetplayOn())
+    return false;
+
+  // A set passed twice (4B4D07E7 passes one set as read, write and except) counts once, as
+  // the first of them; treating it as writable would report every socket ready (Xenia).
+  const ppc_ptr_t<x_fd_set> args[3] = {readfds, writefds, exceptfds};
+  uint8_t* sets[3] = {};
+  for (int i = 0; i < 3; ++i) {
+    if (!args[i])
+      continue;
+    bool aliased = false;
+    for (int j = 0; j < i; ++j) {
+      aliased |= args[j] && args[j].guest_address() == args[i].guest_address();
+    }
+    if (aliased)
+      continue;
+    if (!GuestOk(args[i], np::kFdSetBytes)) {
+      *result = WsaFail(wsa::kFault);
+      return true;
+    }
+    sets[i] = HostBytes(args[i]);
+  }
+
+  const np::SelectPlan plan = np::PlanSelect(sets);
+  if (!plan.vnet)
+    return false;
+  if (plan.err != wsa::kOk) {
+    *result = WsaFail(plan.err);
+    return true;
+  }
+
+  int64_t timeout_us = -1;
+  if (timeout_ptr) {
+    if (!GuestOk(timeout_ptr, np::kTimevalBytes)) {
+      *result = WsaFail(wsa::kFault);
+      return true;
+    }
+    int32_t sec = static_cast<int32_t>(np::LoadBe32(HostBytes(timeout_ptr)));
+    int32_t usec = static_cast<int32_t>(np::LoadBe32(HostBytes(timeout_ptr) + 4));
+    chrono::Clock::ScaleGuestDurationTimeval(&sec, &usec);
+    const int err = np::TimevalToMicros(sec, usec, &timeout_us);
+    if (err != wsa::kOk) {
+      *result = WsaFail(err);
+      return true;
+    }
+  }
+
+  ac6net::vnet::SelectSets ready = plan.query;
+  int err = wsa::kOk;
+  if (Vnet().Select(&ready, timeout_us, &err) < 0) {
+    *result = WsaFail(err);
+    return true;
+  }
+  *result = np::FinishSelect(sets, plan, ready);
+  return true;
+}
+
+}  // namespace
+#endif  // REX_HAVE_AC6NET
+
 ppc_i32_result_t NetDll_select_entry(ppc_i32_t caller, ppc_i32_t nfds, ppc_ptr_t<x_fd_set> readfds,
                                      ppc_ptr_t<x_fd_set> writefds, ppc_ptr_t<x_fd_set> exceptfds,
                                      ppc_pvoid_t timeout_ptr) {
+#if REX_HAVE_AC6NET
+  i32 vnet_result = 0;
+  if (TryVnetSelect(readfds, writefds, exceptfds, timeout_ptr, &vnet_result)) {
+    return vnet_result;
+  }
+#endif
   host_set host_readfds = {0};
   fd_set native_readfds = {0};
   if (readfds) {
@@ -850,6 +1782,11 @@ ppc_i32_result_t NetDll_select_entry(ppc_i32_t caller, ppc_i32_t nfds, ppc_ptr_t
 
 ppc_u32_result_t NetDll_recv_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_pvoid_t buf_ptr,
                                    ppc_u32_t buf_len, ppc_u32_t flags) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(VnetRecv(socket_handle, buf_ptr, buf_len, flags));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -863,6 +1800,12 @@ ppc_u32_result_t NetDll_recv_entry(ppc_u32_t caller, ppc_u32_t socket_handle, pp
 ppc_u32_result_t NetDll_recvfrom_entry(ppc_u32_t caller, ppc_u32_t socket_handle,
                                        ppc_pvoid_t buf_ptr, ppc_u32_t buf_len, ppc_u32_t flags,
                                        ppc_ptr_t<XSOCKADDR_IN> from_ptr, ppc_pu32_t fromlen_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(
+        VnetRecvFrom(socket_handle, buf_ptr, buf_len, flags, from_ptr, fromlen_ptr));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -903,6 +1846,13 @@ ppc_u32_result_t NetDll_recvfrom_entry(ppc_u32_t caller, ppc_u32_t socket_handle
 
 ppc_u32_result_t NetDll_send_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_pvoid_t buf_ptr,
                                    ppc_u32_t buf_len, ppc_u32_t flags) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    if (buf_len && !GuestOk(buf_ptr, buf_len))
+      return static_cast<u32>(WsaFail(wsa::kFault));
+    return static_cast<u32>(VnetSend(socket_handle, buf_ptr.host_address(), buf_len, flags));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -916,6 +1866,14 @@ ppc_u32_result_t NetDll_send_entry(ppc_u32_t caller, ppc_u32_t socket_handle, pp
 ppc_u32_result_t NetDll_sendto_entry(ppc_u32_t caller, ppc_u32_t socket_handle, ppc_pvoid_t buf_ptr,
                                      ppc_u32_t buf_len, ppc_u32_t flags,
                                      ppc_ptr_t<XSOCKADDR_IN> to_ptr, ppc_u32_t to_len) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    if (buf_len && !GuestOk(buf_ptr, buf_len))
+      return static_cast<u32>(WsaFail(wsa::kFault));
+    return static_cast<u32>(
+        VnetSendTo(socket_handle, buf_ptr.host_address(), buf_len, flags, to_ptr, to_len));
+  }
+#endif
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK
@@ -925,6 +1883,41 @@ ppc_u32_result_t NetDll_sendto_entry(ppc_u32_t caller, ppc_u32_t socket_handle, 
 
   N_XSOCKADDR_IN native_to(to_ptr);
   return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+}
+
+// getsockname / getpeername / getsockopt: implemented for vnet sockets. On the XSocket path
+// they keep the behaviour of the former REX_EXPORT_STUBs (log, return r3 = caller).
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             ppc_pu32_t namelen_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(VnetGetName(socket_handle, name, namelen_ptr, /*peer=*/false));
+  }
+#endif
+  REXKRNL_WARN("{} STUB", "__imp__NetDll_getsockname");
+  return caller;
+}
+
+u32 NetDll_getpeername_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             ppc_pu32_t namelen_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(VnetGetName(socket_handle, name, namelen_ptr, /*peer=*/true));
+  }
+#endif
+  REXKRNL_WARN("{} STUB", "__imp__NetDll_getpeername");
+  return caller;
+}
+
+u32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                            ppc_pvoid_t optval_ptr, ppc_pu32_t optlen_ptr) {
+#if REX_HAVE_AC6NET
+  if (IsVnetSocket(socket_handle)) {
+    return static_cast<u32>(VnetGetOption(socket_handle, level, optname, optval_ptr, optlen_ptr));
+  }
+#endif
+  REXKRNL_WARN("{} STUB", "__imp__NetDll_getsockopt");
+  return caller;
 }
 
 ppc_u32_result_t NetDll___WSAFDIsSet_entry(ppc_u32_t socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -993,6 +1986,15 @@ XAM_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
 XAM_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 XAM_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 XAM_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+#if REX_HAVE_AC6NET
+// Formerly weak XAM_EXPORT_STUBs; without ac6net the stubs below are kept unchanged.
+XAM_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
+XAM_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
+XAM_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+XAM_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
+XAM_EXPORT(__imp__NetDll_getpeername, rex::kernel::xam::NetDll_getpeername_entry)
+XAM_EXPORT(__imp__NetDll_getsockopt, rex::kernel::xam::NetDll_getsockopt_entry)
+#endif
 
 XAM_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
 XAM_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
@@ -1039,7 +2041,9 @@ XAM_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 XAM_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 XAM_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
 XAM_EXPORT_STUB(__imp__NetDll_XNetConnect);
+#if !REX_HAVE_AC6NET
 XAM_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+#endif
 XAM_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 XAM_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 XAM_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
@@ -1048,8 +2052,10 @@ XAM_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 XAM_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 XAM_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 XAM_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
+#if !REX_HAVE_AC6NET
 XAM_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
 XAM_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
+#endif
 XAM_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 XAM_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 XAM_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
@@ -1105,6 +2111,8 @@ XAM_EXPORT_STUB(__imp__NetDll_XnpToolIpProxyInject);
 XAM_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 XAM_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 XAM_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
+#if !REX_HAVE_AC6NET
 XAM_EXPORT_STUB(__imp__NetDll_getpeername);
 XAM_EXPORT_STUB(__imp__NetDll_getsockname);
 XAM_EXPORT_STUB(__imp__NetDll_getsockopt);
+#endif

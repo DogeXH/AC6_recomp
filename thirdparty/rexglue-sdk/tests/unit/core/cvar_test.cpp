@@ -6,8 +6,13 @@
  * @license     BSD 3-Clause License
  */
 
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <stdexcept>
+#include <string>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -26,6 +31,77 @@ REXCVAR_DEFINE_STRING(test_init_only_flag, "initial", "Test", "Init-only flag")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(test_restart_flag, false, "Test", "Requires restart")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+
+class ScopedPrecedenceTest {
+ public:
+  ScopedPrecedenceTest() {
+    rex::cvar::testing::ResetAllForTesting();
+    const auto seed = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+      auto candidate = std::filesystem::temp_directory_path() /
+                       ("rex-cvar-precedence-" + std::to_string(seed) + "-" +
+                        std::to_string(attempt));
+      std::error_code ec;
+      if (std::filesystem::create_directory(candidate, ec)) {
+        temp_dir_ = std::move(candidate);
+        config_path_ = temp_dir_ / "config.toml";
+        return;
+      }
+    }
+    throw std::runtime_error("could not create a unique cvar test directory");
+  }
+
+  ~ScopedPrecedenceTest() {
+    if (environment_touched_) {
+      SetEnvironmentValue(original_environment_value_);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(temp_dir_, ec);
+    rex::cvar::testing::ResetAllForTesting();
+  }
+
+  const std::filesystem::path& config_path() const { return config_path_; }
+
+  void WriteConfig(std::string_view contents) const {
+    std::ofstream file(config_path_);
+    if (!file) {
+      throw std::runtime_error("could not create cvar test config");
+    }
+    file << contents;
+  }
+
+  void SetEnvironment(std::string value) {
+    if (!environment_touched_) {
+      if (const char* original = std::getenv("REX_TEST_INT32_FLAG")) {
+        original_environment_value_ = std::string(original);
+      }
+      environment_touched_ = true;
+    }
+    SetEnvironmentValue(std::move(value));
+  }
+
+ private:
+  static void SetEnvironmentValue(const std::optional<std::string>& value) {
+#ifdef _WIN32
+    _putenv_s("REX_TEST_INT32_FLAG", value ? value->c_str() : "");
+#else
+    if (value) {
+      setenv("REX_TEST_INT32_FLAG", value->c_str(), 1);
+    } else {
+      unsetenv("REX_TEST_INT32_FLAG");
+    }
+#endif
+  }
+
+  std::filesystem::path temp_dir_;
+  std::filesystem::path config_path_;
+  bool environment_touched_ = false;
+  std::optional<std::string> original_environment_value_;
+};
+
+}  // namespace
 
 TEST_CASE("cvar registry stores flag metadata", "[cvar]") {
   auto flags = rex::cvar::ListFlags();
@@ -180,6 +256,114 @@ TEST_CASE("cvar TOML config loading", "[cvar]") {
     auto missing = temp_dir / "nonexistent.toml";
     rex::cvar::LoadConfig(missing);
   }
+}
+
+TEST_CASE("cvar command-line values take precedence over TOML", "[cvar]") {
+  ScopedPrecedenceTest state;
+  state.WriteConfig("test_int32_flag = 999\n");
+
+  char arg0[] = "cvar_test";
+  char arg1[] = "--test_int32_flag=456";
+  char* argv[] = {arg0, arg1};
+  auto remaining = rex::cvar::Init(2, argv);
+  REQUIRE(remaining.empty());
+  REQUIRE(REXCVAR_GET(test_int32_flag) == 456);
+
+  rex::cvar::LoadConfig(state.config_path());
+
+  CHECK(REXCVAR_GET(test_int32_flag) == 456);
+  CHECK(rex::cvar::IsUserSet("test_int32_flag"));
+  CHECK(rex::cvar::SerializeToTOML() == "test_int32_flag = 999\n");
+}
+
+TEST_CASE("cvar environment values take precedence over command line and TOML", "[cvar]") {
+  ScopedPrecedenceTest state;
+  state.WriteConfig("test_int32_flag = 999\n");
+
+  char arg0[] = "cvar_test";
+  char arg1[] = "--test_int32_flag=456";
+  char* argv[] = {arg0, arg1};
+  auto remaining = rex::cvar::Init(2, argv);
+  REQUIRE(remaining.empty());
+  state.SetEnvironment("222");
+  rex::cvar::ApplyEnvironment();
+  REQUIRE(REXCVAR_GET(test_int32_flag) == 222);
+
+  rex::cvar::LoadConfig(state.config_path());
+
+  CHECK(REXCVAR_GET(test_int32_flag) == 222);
+  CHECK(rex::cvar::IsUserSet("test_int32_flag"));
+  CHECK(rex::cvar::SerializeToTOML() == "test_int32_flag = 999\n");
+}
+
+TEST_CASE("cvar rejects invalid saved values hidden by a launch override", "[cvar]") {
+  ScopedPrecedenceTest state;
+  state.WriteConfig("test_int32_flag = \"not-an-integer\"\n");
+
+  char arg0[] = "cvar_test";
+  char arg1[] = "--test_int32_flag=456";
+  char* argv[] = {arg0, arg1};
+  auto remaining = rex::cvar::Init(2, argv);
+  REQUIRE(remaining.empty());
+
+  rex::cvar::LoadConfig(state.config_path());
+
+  CHECK(REXCVAR_GET(test_int32_flag) == 456);
+  CHECK_FALSE(rex::cvar::IsUserSet("test_int32_flag"));
+  CHECK(rex::cvar::SerializeToTOML().empty());
+}
+
+TEST_CASE("cvar rejects an invalid hidden Boolean value", "[cvar]") {
+  ScopedPrecedenceTest state;
+  state.WriteConfig("test_bool_flag = \"garbage\"\n");
+
+  char arg0[] = "cvar_test";
+  char arg1[] = "--test_bool_flag";
+  char* argv[] = {arg0, arg1};
+  auto remaining = rex::cvar::Init(2, argv);
+  REQUIRE(remaining.empty());
+
+  rex::cvar::LoadConfig(state.config_path());
+
+  CHECK(REXCVAR_GET(test_bool_flag));
+  CHECK_FALSE(rex::cvar::IsUserSet("test_bool_flag"));
+  CHECK(rex::cvar::SerializeToTOML().empty());
+}
+
+TEST_CASE("cvar does not mark a partially parsed launch override", "[cvar]") {
+  ScopedPrecedenceTest state;
+  state.WriteConfig("test_int32_flag = 999\n");
+
+  char arg0[] = "cvar_test";
+  char arg1[] = "--test_int32_flag=456junk";
+  char* argv[] = {arg0, arg1};
+  auto remaining = rex::cvar::Init(2, argv);
+  REQUIRE(remaining.empty());
+  CHECK(REXCVAR_GET(test_int32_flag) == 42);
+
+  rex::cvar::LoadConfig(state.config_path());
+
+  CHECK(REXCVAR_GET(test_int32_flag) == 999);
+  CHECK(rex::cvar::IsUserSet("test_int32_flag"));
+  CHECK(rex::cvar::SerializeToTOML() == "test_int32_flag = 999\n");
+}
+
+TEST_CASE("cvar launch doubles preserve full input precision", "[cvar]") {
+  ScopedPrecedenceTest state;
+  state.WriteConfig("test_double_flag = 9.25\n");
+
+  constexpr double kExpected = 0.123456789012345;
+  char arg0[] = "cvar_test";
+  char arg1[] = "--test_double_flag=0.123456789012345";
+  char* argv[] = {arg0, arg1};
+  auto remaining = rex::cvar::Init(2, argv);
+  REQUIRE(remaining.empty());
+  REQUIRE(REXCVAR_GET(test_double_flag) == Catch::Approx(kExpected).epsilon(1e-14));
+
+  rex::cvar::LoadConfig(state.config_path());
+
+  CHECK(REXCVAR_GET(test_double_flag) == Catch::Approx(kExpected).epsilon(1e-14));
+  CHECK(rex::cvar::IsUserSet("test_double_flag"));
 }
 
 TEST_CASE("cvar range validation", "[cvar]") {

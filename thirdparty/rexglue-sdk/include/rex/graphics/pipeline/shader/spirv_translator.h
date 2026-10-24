@@ -27,13 +27,19 @@ namespace rex::graphics {
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
   union Modification {
-    // If anything in this is structure is changed in a way not compatible with
+    // If anything in this structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
-    // prototyping stage (easier to do small granular updates with an
-    // incremental counter).
-    static constexpr uint32_t kVersion = 13;
+    static constexpr uint32_t kVersion = 0x20260821;
+
+    // Part of the persistent translation identity. Fetch lowering must consult
+    // this raw stage-independent bit rather than the mutable cvar so an already
+    // cached translation can never be reused with different rounding. Bit 50
+    // is outside both the vertex and pixel structured fields (bit 49 is
+    // reserved by the AC6 terrain-sign correction).
+    static constexpr uint32_t kVfetchIndexRoundingBiasBit = 50;
+    static constexpr uint64_t kVfetchIndexRoundingBiasMask =
+        UINT64_C(1) << kVfetchIndexRoundingBiasBit;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -996,8 +1002,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id main_memexport_allowed_;
   // VS rectangle-list fallback only - uint.
   spv::Id var_main_rectangle_guest_vertex_index_;
-  // VS rectangle-list fallback only - gl_PerVertex[3].
-  spv::Id var_main_rectangle_per_vertex_;
+  // VS rectangle-list fallback only - float4[3].
+  spv::Id var_main_rectangle_positions_;
+  // VS rectangle-list fallback only - float[clip_distance_count][3].
+  spv::Id var_main_rectangle_clip_distances_;
+  // VS rectangle-list fallback only - float[cull_distance_count][3].
+  spv::Id var_main_rectangle_cull_distances_;
   // VS rectangle-list fallback only - float4[3] for each used interpolator.
   std::array<spv::Id, xenos::kMaxInterpolators> var_main_rectangle_interpolators_;
   // VS only - float3 (special exports).

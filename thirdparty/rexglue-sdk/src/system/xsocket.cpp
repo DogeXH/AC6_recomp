@@ -3,6 +3,7 @@
  * Copyright (c) 2026 Tom Clay. All rights reserved.
  */
 
+#include <cerrno>
 #include <cstring>
 
 #include <rex/kernel/xam/module.h>
@@ -105,6 +106,22 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
+#if !REX_PLATFORM_WIN32
+  if (ret < 0 && (errno == EACCES || errno == EPERM)) {
+    const uint16_t guest_port = static_cast<uint16_t>(name->sin_port);
+    if (guest_port < 1024) {
+      // Consoles may bind well-known title ports as an ordinary process,
+      // while POSIX hosts normally reserve ports below 1024. Map the native
+      // endpoint deterministically and retain bound_port_ as the guest port.
+      // This keeps offline/LAN polling functional without requiring elevated
+      // capabilities on the recompiled game binary.
+      constexpr uint16_t kUnprivilegedPortOffset = 10000;
+      N_XSOCKADDR_IN mapped_name = *name;
+      mapped_name.sin_port = static_cast<uint16_t>(guest_port + kUnprivilegedPortOffset);
+      ret = bind(native_handle_, reinterpret_cast<sockaddr*>(&mapped_name), name_len);
+    }
+  }
+#endif
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }

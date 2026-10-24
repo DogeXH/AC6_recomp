@@ -1,0 +1,291 @@
+{
+  "version": 1,
+  "generator": "netplay/server/cmd/vectors (go run ./cmd/vectors)",
+  "notes": [
+    "All binary values are lower-case hex. u64/u32 fields inside packets are little-endian unless noted.",
+    "nonce = ctr (u64 LE) || 16 zero bytes; sealed = ciphertext || 16-byte Poly1305 tag (XChaCha20-Poly1305, IETF construction).",
+    "Packet 'header' is the AEAD associated data: bytes[0..50) for HELLO, [0..26) for C2S, [0..18) for HELLO_ACK, S2C and P2P.",
+    "The client (peer A) sends HELLO with ctr 1 and the RPC with ctr 2 under the same c2s key; the server sends HELLO_ACK with ctr 1 and the RPC response with ctr 2 under the s2c key.",
+    "p2p_data carries a vnet datagram on channel 0x01: proto 254, src/dst port 999 (BE), msg_id 1 (u16 LE), frag 0 of 1."
+  ],
+  "x25519": [
+    {
+      "name": "client",
+      "sk": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "pk": "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c"
+    },
+    {
+      "name": "server",
+      "sk": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+      "pk": "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b"
+    },
+    {
+      "name": "peer_b",
+      "sk": "4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60",
+      "pk": "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466"
+    }
+  ],
+  "dh": [
+    {
+      "a": "client",
+      "b": "server",
+      "shared": "a84dc7c3c8f058b1b2dc4cd1e9b5dc0a7987f88b6a9564cde3391fc421159e77"
+    },
+    {
+      "a": "client",
+      "b": "peer_b",
+      "shared": "26c2c17fdb82161cb21ad16e721315355b64d1763119b10bfc962530dc7cc163"
+    }
+  ],
+  "kdf": [
+    {
+      "name": "c2s",
+      "label": "AC6NET-C2S-1",
+      "key": "a84dc7c3c8f058b1b2dc4cd1e9b5dc0a7987f88b6a9564cde3391fc421159e77",
+      "parts": [
+        "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+        "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b",
+        "0123456789abcdef"
+      ],
+      "message": "4143364e45542d4332532d3107a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b0123456789abcdef",
+      "out": "aad41314f38d746c8fb9938a9f6f328851a350904f71f41dbac551f4c738611a"
+    },
+    {
+      "name": "s2c",
+      "label": "AC6NET-S2C-1",
+      "key": "a84dc7c3c8f058b1b2dc4cd1e9b5dc0a7987f88b6a9564cde3391fc421159e77",
+      "parts": [
+        "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+        "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b",
+        "0123456789abcdef",
+        "fedcba9876543210"
+      ],
+      "message": "4143364e45542d5332432d3107a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b0123456789abcdeffedcba9876543210",
+      "out": "a5b07b85b312d70b22cd8ad05dceae12300649a34b26ce86d379d5ca421eef8e"
+    },
+    {
+      "name": "p2p_a_to_b",
+      "label": "AC6NET-P2P-1",
+      "key": "26c2c17fdb82161cb21ad16e721315355b64d1763119b10bfc962530dc7cc163",
+      "parts": [
+        "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+        "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466",
+        "0123456789abcdef",
+        "0f1e2d3c4b5a6978"
+      ],
+      "message": "4143364e45542d5032502d3107a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d484660123456789abcdef0f1e2d3c4b5a6978",
+      "out": "0ab8c5c14456c4990e8ec6432f75a5293e805b1132aefab8e34c18bcf64c5a7d"
+    },
+    {
+      "name": "p2p_b_to_a",
+      "label": "AC6NET-P2P-1",
+      "key": "26c2c17fdb82161cb21ad16e721315355b64d1763119b10bfc962530dc7cc163",
+      "parts": [
+        "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466",
+        "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+        "0f1e2d3c4b5a6978",
+        "0123456789abcdef"
+      ],
+      "message": "4143364e45542d5032502d3164b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d4846607a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c0f1e2d3c4b5a69780123456789abcdef",
+      "out": "a95ad972c1793984fb3d3fa7229947cb8d463b6503be1a5a1879b580f1508c49"
+    }
+  ],
+  "aead": [
+    {
+      "name": "empty",
+      "key": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "ctr": 1,
+      "nonce": "010000000000000000000000000000000000000000000000",
+      "ad": "",
+      "plaintext": "",
+      "sealed": "aba8baeedb34dfe27fef998a10dba4b4"
+    },
+    {
+      "name": "short",
+      "key": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "ctr": 2,
+      "nonce": "020000000000000000000000000000000000000000000000",
+      "ad": "a603",
+      "plaintext": "6163366e6574",
+      "sealed": "6dc2b87958c2ea5ba2b5c360e8c15d192e94e55760d6"
+    },
+    {
+      "name": "multi_block",
+      "key": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "ctr": 72623859790382856,
+      "nonce": "080706050403020100000000000000000000000000000000",
+      "ad": "6173736f6369617465642064617461",
+      "plaintext": "00070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71",
+      "sealed": "2a01b50b4b8d85e2ed186c770270cd007713628f691d81b84c14170a7a1ae342c186129742f48274d6de9527aaeadb7ceb5115cafd639e807b81bb3db3ff1841d305a96cf0fdba89944dbdecca81034acd26232183cb119c9a314b51dd62edcbf5d85619e12ec919bab24352fc7d4f1c1580cf4669b5d5dca9b8a08cf0e839c3f13120e3212b178a3e63f54c9285bd7b8b6f81c23e8c370607485fa824ea6895f0f4c3e9e15b91de05f4f7037eaacfc1bad91f21827a96b40bfb370d728cab20f88614b713832301cfb2d9cdc22dd15dcd688efdea134e68"
+    },
+    {
+      "name": "c2s_key",
+      "key": "aad41314f38d746c8fb9938a9f6f328851a350904f71f41dbac551f4c738611a",
+      "ctr": 18446744073709551614,
+      "nonce": "feffffffffffffff00000000000000000000000000000000",
+      "ad": "a6",
+      "plaintext": "7b2270696e67223a747275657d",
+      "sealed": "b8275c98c14d72c4257c1baa8e6d9ccafbe8db447ce39ade08e243fbb3"
+    }
+  ],
+  "packets": {
+    "hello": {
+      "description": "HELLO (0x01), client to server",
+      "key": "aad41314f38d746c8fb9938a9f6f328851a350904f71f41dbac551f4c738611a",
+      "key_name": "c2s",
+      "ctr": 1,
+      "header": "a60107a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c0123456789abcdef0100000000000000",
+      "plaintext": "7b2276223a312c22636c69656e74223a226163367265636f6d702d6e6574706c61792f302e31222c2267616d6572746167223a2254616c69736d616e222c227469746c65223a223445344430374431222c22636f6d706174223a226135316135333538353165363332313131613539633164636438366134326563222c226c6f63616c223a5b5b223139322e3136382e312e3230222c35313233345d5d2c2270726976616379223a66616c73657d",
+      "plaintext_text": "{\"v\":1,\"client\":\"ac6recomp-netplay/0.1\",\"gamertag\":\"Talisman\",\"title\":\"4E4D07D1\",\"compat\":\"a51a535851e632111a59c1dcd86a42ec\",\"local\":[[\"192.168.1.20\",51234]],\"privacy\":false}",
+      "fields": {
+        "c_boot": "0123456789abcdef",
+        "c_pk": "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+        "ctr": "1"
+      },
+      "bytes": "a60107a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c0123456789abcdef01000000000000009afa006ff3a05999be8acfb9dea1551478c3ae3d3bcf440f51614157506c37c2401a87824c3330bf0318b1463f16ebbc1d6605bdbdd44a358129f98461b8716917c00b23a58b11554c01f6ff6b57a8966780a8edabd78c3529f523eb70d1bf0a17e7e1fd46535537c0bd8c5bed506918c07c2649038a2366c1fdd236c6f5c697ed1a92dc6b6d560bdb14f456c06cee7860d683ca652e562148422e1d5e5d9de187032f0bacbc3d331f75071220f6802229597daaa2d3e74bdfebcdb3cf5f"
+    },
+    "hello_ack": {
+      "description": "HELLO_ACK (0x02), server to client",
+      "key": "a5b07b85b312d70b22cd8ad05dceae12300649a34b26ce86d379d5ca421eef8e",
+      "key_name": "s2c",
+      "ctr": 1,
+      "header": "a602fedcba98765432100100000000000000",
+      "plaintext": "7b2276223a312c22706565725f6964223a2239663363356137623131323233333434222c2278756964223a2230303039613162326333643465356636222c22766970223a2231302e36342e302e37222c2267616d6572746167223a2254616c69736d616e222c227075626c6963223a5b223230332e302e3131332e39222c34303132335d2c227365727665725f74696d655f6d73223a313736303030303030303030302c226d6f7464223a22227d",
+      "plaintext_text": "{\"v\":1,\"peer_id\":\"9f3c5a7b11223344\",\"xuid\":\"0009a1b2c3d4e5f6\",\"vip\":\"10.64.0.7\",\"gamertag\":\"Talisman\",\"public\":[\"203.0.113.9\",40123],\"server_time_ms\":1760000000000,\"motd\":\"\"}",
+      "fields": {
+        "ctr": "1",
+        "s_boot": "fedcba9876543210"
+      },
+      "bytes": "a602fedcba9876543210010000000000000013a399c52306185b4ba198b67858ac701649e8b43954b6fe67b5bc0753503edcf8b82f40c8da0fec7dd557e4d741a0c71d04e7b428eb8b91420a6eea0e99fabc6148828bc75ac1e988e9b89d5be8d1ba3f4b1035ce2aec6a95ceae00e01a363c0d885ee33bdcb237df2abd9e98125a8a585e6edaac47653541d4c95f23e1836cdb096a57f5ac75800c5e77f876ecc1c09855474fe5ee6b16d679fec90da60e615492599a4447a8aec3cd3d366e21cd11ac8bbc2df1e3f62478e1340846af"
+    },
+    "c2s_rpc_req": {
+      "description": "C2S (0x03) carrying RPC_REQ (0x10): req_id 1, fragment 0 of 1",
+      "key": "aad41314f38d746c8fb9938a9f6f328851a350904f71f41dbac551f4c738611a",
+      "key_name": "c2s",
+      "ctr": 2,
+      "header": "a603443322117b5a3c9f0123456789abcdef0200000000000000",
+      "plaintext": "100100000000017b226964223a312c226d223a2277686f616d69222c2261223a7b7d7d",
+      "plaintext_text": "{\"id\":1,\"m\":\"whoami\",\"a\":{}}",
+      "fields": {
+        "c_boot": "0123456789abcdef",
+        "ctr": "2",
+        "frag_cnt": "1",
+        "frag_idx": "0",
+        "kind": "10",
+        "peer_id": "9f3c5a7b11223344",
+        "peer_id_le": "443322117b5a3c9f",
+        "req_id": "1"
+      },
+      "bytes": "a603443322117b5a3c9f0123456789abcdef02000000000000001bd71dbba269c2067d87f9fc666b268f039f798dc248798d35b61fe6dec0178097b04a603e3a11215ba9ac33cd5cc6a760aefd"
+    },
+    "s2c_rpc_resp": {
+      "description": "S2C (0x04) carrying RPC_RESP (0x20): req_id 1, fragment 0 of 1",
+      "key": "a5b07b85b312d70b22cd8ad05dceae12300649a34b26ce86d379d5ca421eef8e",
+      "key_name": "s2c",
+      "ctr": 2,
+      "header": "a604fedcba98765432100200000000000000",
+      "plaintext": "200100000000017b226964223a312c226f6b223a747275652c2272223a7b22706565725f6964223a2239663363356137623131323233333434222c2278756964223a2230303039613162326333643465356636222c22766970223a2231302e36342e302e37222c2267616d6572746167223a2254616c69736d616e222c227075626c6963223a5b223230332e302e3131332e39222c34303132335d7d7d",
+      "plaintext_text": "{\"id\":1,\"ok\":true,\"r\":{\"peer_id\":\"9f3c5a7b11223344\",\"xuid\":\"0009a1b2c3d4e5f6\",\"vip\":\"10.64.0.7\",\"gamertag\":\"Talisman\",\"public\":[\"203.0.113.9\",40123]}}",
+      "fields": {
+        "ctr": "2",
+        "frag_cnt": "1",
+        "frag_idx": "0",
+        "kind": "20",
+        "req_id": "1",
+        "s_boot": "fedcba9876543210"
+      },
+      "bytes": "a604fedcba98765432100200000000000000d8467f801935ef936bcab32c140922d74e1242a3760b57b7e3f242a8509afff0ba6b2c3bfe43f9220564043797856c6eaf0e25b63a8765caeb27d607f3c21daf17b2565aa16bb2ee81e9f87af976e583a7dac0fca16d8e0edcb601e02356998cb482899ca710ce1dced51be343a711495e5d441efc9296bbd9af401a4c2fff1e617915b82c1ec1176ecad9d5720c5a9ecb937796097170948c75c8aea2c5fd32d7d756c7cdf82b4c6262144ab1"
+    },
+    "p2p_data": {
+      "description": "P2P (0x10) DATA (0x04) from peer A (client) to peer B, channel 0x01",
+      "key": "0ab8c5c14456c4990e8ec6432f75a5293e805b1132aefab8e34c18bcf64c5a7d",
+      "key_name": "p2p_a_to_b",
+      "ctr": 1,
+      "header": "a610443322117b5a3c9f0100000000000000",
+      "plaintext": "0401fe03e703e70100000141433620646174616772616d",
+      "fields": {
+        "channel": "01",
+        "ctr": "1",
+        "kind": "04",
+        "payload_text": "AC6 datagram",
+        "src_peer_id": "9f3c5a7b11223344"
+      },
+      "bytes": "a610443322117b5a3c9f01000000000000009c981c4c73a0f800e669b2ff883dcb273a4902bdb1f14ab2820833bf346ca41d7ed8adbe160009"
+    },
+    "relay": {
+      "description": "RELAY (0x06), clear framing around packets.p2p_data, from A to B",
+      "header": "a606443322117b5a3c9fc5b4a39281706f5e",
+      "fields": {
+        "dst_peer_id": "5e6f708192a3b4c5",
+        "src_peer_id": "9f3c5a7b11223344"
+      },
+      "bytes": "a606443322117b5a3c9fc5b4a39281706f5ea610443322117b5a3c9f01000000000000009c981c4c73a0f800e669b2ff883dcb273a4902bdb1f14ab2820833bf346ca41d7ed8adbe160009"
+    },
+    "relayed": {
+      "description": "RELAYED (0x07), what B receives for packets.relay",
+      "header": "a607443322117b5a3c9f",
+      "fields": {
+        "src_peer_id": "9f3c5a7b11223344"
+      },
+      "bytes": "a607443322117b5a3c9fa610443322117b5a3c9f01000000000000009c981c4c73a0f800e669b2ff883dcb273a4902bdb1f14ab2820833bf346ca41d7ed8adbe160009"
+    }
+  },
+  "replay": {
+    "sequence": [
+      0,
+      1,
+      1,
+      3,
+      2,
+      2,
+      1030,
+      6,
+      7,
+      5,
+      1031,
+      1030,
+      2000,
+      976,
+      977,
+      3000
+    ],
+    "accepted": [
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "compat": [
+    {
+      "title": "4E4D07D1",
+      "media": "531C30BE",
+      "version": 8,
+      "protocol": 1,
+      "fps_mode": "60",
+      "message": "4143364e45542d434f4d5041542d31d1074d4ebe301c5308000000010000003630",
+      "key": "a51a535851e632111a59c1dcd86a42ec"
+    },
+    {
+      "title": "4E4D07D1",
+      "media": "531C30BE",
+      "version": 8,
+      "protocol": 1,
+      "fps_mode": "30",
+      "message": "4143364e45542d434f4d5041542d31d1074d4ebe301c5308000000010000003330",
+      "key": "769a73c1bf1caaf0e24910e61354b353"
+    }
+  ]
+}

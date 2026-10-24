@@ -111,7 +111,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260809;
+    static constexpr uint32_t kVersion = 0x20260821;
+
+    // Kept at the same persistent-key bit as the SPIR-V translator. This raw
+    // stage-independent bit is outside both structured layouts (bit 49 is
+    // reserved by the AC6 terrain-sign correction).
+    static constexpr uint32_t kVfetchIndexRoundingBiasBit = 50;
+    static constexpr uint64_t kVfetchIndexRoundingBiasMask =
+        UINT64_C(1) << kVfetchIndexRoundingBiasBit;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,

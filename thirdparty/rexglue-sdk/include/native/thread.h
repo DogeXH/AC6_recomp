@@ -189,6 +189,21 @@ class Event : public WaitHandle {
   virtual void Set() = 0;
   virtual void Reset() = 0;
   virtual void Pulse() = 0;
+
+  // NT event operations return the state that existed before the operation.
+  // Defaults preserve behavior on backends that do not expose it yet.
+  virtual bool SetQueryPrevious() {
+    Set();
+    return false;
+  }
+  virtual bool ResetQueryPrevious() {
+    Reset();
+    return false;
+  }
+  virtual bool PulseQueryPrevious() {
+    Pulse();
+    return false;
+  }
 };
 
 class Semaphore : public WaitHandle {

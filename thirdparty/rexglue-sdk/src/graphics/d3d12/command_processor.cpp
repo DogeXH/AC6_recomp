@@ -58,6 +58,22 @@ namespace rex::graphics::d3d12 {
 
 namespace {
 
+class GuestPresentRetirementScope {
+ public:
+  GuestPresentRetirementScope() = default;
+  GuestPresentRetirementScope(const GuestPresentRetirementScope&) = delete;
+  GuestPresentRetirementScope& operator=(
+      const GuestPresentRetirementScope&) = delete;
+  ~GuestPresentRetirementScope() {
+    GraphicsSystem::RetireGuestPresent(delivered_);
+  }
+
+  void MarkDelivered() { delivered_ = true; }
+
+ private:
+  bool delivered_ = false;
+};
+
 constexpr size_t kSuspiciousSpriteStateHistorySize = 16;
 
 struct SuspiciousSpriteStateWrite {
@@ -2139,7 +2155,14 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
-  (void)IssueSwapInternal(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  // Only PM4 IssueSwap owns a VdSwap pacing reservation. The direct-swap
+  // compatibility path calls IssueSwapInternal without a reservation, so the
+  // exactly-once retirement guard deliberately lives in this wrapper.
+  GuestPresentRetirementScope guest_present_retirement;
+  if (IssueSwapInternal(frontbuffer_ptr, frontbuffer_width,
+                        frontbuffer_height)) {
+    guest_present_retirement.MarkDelivered();
+  }
 }
 
 bool D3D12CommandProcessor::IssueSwapInternal(uint32_t frontbuffer_ptr,
@@ -2631,12 +2654,6 @@ bool D3D12CommandProcessor::IssueSwapInternal(uint32_t frontbuffer_ptr,
         REXGPU_DEBUG("RefreshGuestOutput: checkpoint 8 (return true)");
         return true;
       });
-
-  if (refreshed) {
-    // A guest frame was actually delivered to the presenter - feed the
-    // delivery-paced present pacing (see GraphicsSystem::NotifyGuestPresent).
-    GraphicsSystem::NotifyGuestPresent();
-  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.

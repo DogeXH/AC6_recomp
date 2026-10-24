@@ -136,7 +136,8 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
           a_.OpAdd(address_dest, index_operand, dxbc::Src::LF(0.5f));
           a_.OpRoundNI(address_dest, address_src);
         } else {
-          if (REXCVAR_GET(vfetch_index_rounding_bias)) {
+          if (GetDxbcShaderModification().value &
+              Modification::kVfetchIndexRoundingBiasMask) {
             a_.OpAdd(address_dest, index_operand, dxbc::Src::LF(0.00025f));
             a_.OpRoundNI(address_dest, address_src);
           } else {

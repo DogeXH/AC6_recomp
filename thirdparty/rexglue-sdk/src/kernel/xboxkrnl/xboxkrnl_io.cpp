@@ -381,9 +381,10 @@ ppc_u32_result_t NtReadFile_entry(ppc_u32_t file_handle, ppc_u32_t event_handle,
       }
     }
 
-    if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
-      result = X_STATUS_PENDING;
-    }
+    // XFile::Read completes inline: the data and IOSB are final and all
+    // completion notifications have already been emitted. Returning PENDING
+    // here would make callers wait for an operation that no longer exists and
+    // can collapse multiple completions onto the file's auto-reset event.
     signal_event = true;
 
     if (focused_pac_read) {

@@ -43,13 +43,19 @@ class TracePlayer : public TraceReader {
   void SeekFrame(int target_frame);
   void SeekCommand(int target_command);
 
+  // Diagnostic replay of a self-contained trace byte range, such as the
+  // generic resolve/copy packets and swap following the final draw.
+  void ReplayRange(const uint8_t* trace_data, size_t trace_size,
+                   bool skip_memory_reads = false);
+
   void WaitOnPlayback();
 
  private:
   void PlayTrace(const uint8_t* trace_data, size_t trace_size, TracePlaybackMode playback_mode,
-                 bool clear_caches);
+                 bool clear_caches, bool skip_memory_reads = false);
   void PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size,
-                         TracePlaybackMode playback_mode, bool clear_caches);
+                         TracePlaybackMode playback_mode, bool clear_caches,
+                         bool skip_memory_reads);
 
   GraphicsSystem* graphics_system_;
   int current_frame_index_;

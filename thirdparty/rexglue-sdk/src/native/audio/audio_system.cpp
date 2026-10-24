@@ -34,6 +34,11 @@ REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "AC6/Fixes",
                     "Emit silence for XMA frames the decoder rejects instead of "
                     "dropping them, preserving multi-stream timing. Off = legacy "
                     "drop behaviour.");
+REXCVAR_DEFINE_BOOL(audio_xma_synchronous_kick, false, "AC6/Fixes",
+                    "Block the kicking guest thread until the decoder worker "
+                    "finishes the pass (legacy behaviour). Default off: kicks "
+                    "are fire-and-forget like real hardware, so guest threads "
+                    "never stall on the decoder (mission fps cost).");
 
 namespace rex::audio {
 

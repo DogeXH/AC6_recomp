@@ -191,6 +191,36 @@ struct ArgTranslator {
         *reinterpret_cast<uint32_t*>(base + ctx.r1.u32 + 0x54 + ((arg - 8) * 8)));
   }
 
+  // Get a full 64-bit integer argument, for parameters declared ppc_u64_t (XUIDs, FILETIMEs,
+  // notification masks, content sizes). The 32-bit getter above returns only the low word.
+  static constexpr uint64_t GetInteger64ArgumentValue(const PPCContext& ctx, uint8_t* base,
+                                                      size_t arg) noexcept {
+    switch (arg) {
+      case 0:
+        return ctx.r3.u64;
+      case 1:
+        return ctx.r4.u64;
+      case 2:
+        return ctx.r5.u64;
+      case 3:
+        return ctx.r6.u64;
+      case 4:
+        return ctx.r7.u64;
+      case 5:
+        return ctx.r8.u64;
+      case 6:
+        return ctx.r9.u64;
+      case 7:
+        return ctx.r10.u64;
+      default:
+        break;
+    }
+    // Stack arguments occupy 8-byte slots at r1 + 0x50 (the 32-bit getter reads the low word
+    // at + 0x54).
+    return __builtin_bswap64(
+        *reinterpret_cast<uint64_t*>(base + ctx.r1.u32 + 0x50 + ((arg - 8) * 8)));
+  }
+
   // Get float/double argument value from FPR
   static double GetPrecisionArgumentValue(const PPCContext& ctx, [[maybe_unused]] uint8_t* base,
                                           size_t arg) noexcept {
@@ -338,6 +368,8 @@ struct ArgTranslator {
     using inner_t = typename ppc_value_inner_type<T>::type;
     if constexpr (is_precise_v<inner_t>) {
       return T(static_cast<inner_t>(GetPrecisionArgumentValue(ctx, base, idx)));
+    } else if constexpr (sizeof(inner_t) == 8) {
+      return T(static_cast<inner_t>(GetInteger64ArgumentValue(ctx, base, idx)));
     } else {
       return T(static_cast<inner_t>(GetIntegerArgumentValue(ctx, base, idx)));
     }
@@ -346,6 +378,9 @@ struct ArgTranslator {
   // Get typed value (non-pointer, non-be<T>, non-PPCPointer, non-PPCValue)
   template <PlainType T>
   static constexpr T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
+    // Plain host types keep the 32-bit read even when they are 8 bytes wide: the CRT hooks
+    // declare the guest's 32-bit size_t as host size_t, and the generated code can leave the
+    // upper register half dirty. Parameters that are 64-bit in the guest use ppc_u64_t.
     if constexpr (is_precise_v<T>) {
       return static_cast<T>(GetPrecisionArgumentValue(ctx, base, idx));
     } else {

@@ -1,0 +1,13 @@
+# Harmless check of the harness itself: no button presses until the title screen, then one
+# START. Captures a few frames and records the netplay sign-in.
+log smoke: start
+screenshot_every 5000 shots/smoke_frames
+wait_trace "ev":"xam.live" 120000
+log smoke: signed in to Live
+wait 20000
+screenshot shots/smoke_title.ppm
+press START
+wait 5000
+screenshot shots/smoke_after_start.ppm
+screenshot_stop
+log smoke: done

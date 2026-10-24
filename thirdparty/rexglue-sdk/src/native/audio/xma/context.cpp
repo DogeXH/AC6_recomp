@@ -25,6 +25,11 @@ namespace rex::audio {
 
 using stream::BitStream;
 
+// These static const members are odr-used by std::max and logging calls, so
+// they require storage definitions because they are not inline or constexpr.
+const uint32_t XmaContext::kBitsPerPacketHeader;
+const uint32_t XmaContext::kOutputMaxSizeBytes;
+
 namespace {
 
 bool IsDeepTraceEnabled() {
@@ -202,7 +207,11 @@ bool XmaContext::Work() {
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
-  if (output_rb.empty()) {
+  // RingBuffer uses equal read/write offsets for both the empty and wrapped-
+  // full states. Only hand the buffer back to the guest after this decode
+  // pass has actually exhausted the remaining output-block budget; otherwise
+  // a zero-output/error pass can expose stale PCM as a newly completed ring.
+  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {
     data.output_buffer_valid = 0;
   }
 
@@ -338,6 +347,13 @@ void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
 
 void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
   if (data->loop_count == 0) {
+    return;
+  }
+
+  // AC6 emits sentinel loop metadata with loop_count=0xff and start=end=0.
+  // It is not a real loop window and must not re-arm subframe skipping.
+  if (REXCVAR_GET(audio_xma_loop_end_guard) &&
+      data->loop_start >= data->loop_end) {
     return;
   }
 

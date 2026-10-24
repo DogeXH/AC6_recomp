@@ -31,6 +31,51 @@ memcpy_s = 0x82381DE0
 memmove_s = 0x823809F0
 
 [functions]
+# Indirect-call targets (vtable entries, this-adjust thunks, a .data callback) that analysis
+# missed. Found by scanning the image's data sections for code pointers that follow a
+# terminator instruction; first hit in online battle (0x82272CE0). See
+# netplay/tools/find_missing_functions.py.
+0x82215d60 = {}
+0x82215d78 = {}
+0x8221eeb0 = {}
+0x8221eed8 = {}
+0x822728a0 = {}
+0x822728b8 = {}
+0x822728d0 = {}
+0x822728e8 = {}
+0x82272900 = {}
+0x82272930 = {}
+0x82272948 = {}
+0x82272960 = {}
+0x82272978 = {}
+0x822729c0 = {}
+0x82272c80 = {}
+0x82272cb0 = {}
+0x82272ce0 = {}
+0x82272cf8 = {}
+0x822d3da0 = {}
+0x822dd838 = {}
+0x822f4330 = {}
+0x822f5230 = {}
+0x822f8988 = {}
+0x823038b8 = {}
+0x82319198 = {}
+0x82360da8 = {}
+0x82361140 = {}
+0x82361258 = {}
+0x82361204 = {}  # tail block of 0x82361140 (was a function before)
+0x8236131c = {}  # tail block of 0x82361258 (was a function before)
+0x82366a90 = {}
+0x8237e260 = {}
+0x823b2998 = {}
+0x823b29d8 = {}
+0x823b29e0 = {}
+0x823b4c08 = {}
+0x823b4c30 = {}
+0x823b4c68 = {}
+0x823b9518 = {}
+0x82360df4 = {}  # keep: existing function next to 0x82360da8
+0x823b9534 = {}  # keep: existing function next to 0x823b9518
 0x82090000 = { name = "rex_sub_82090000" }
 0x820900C8 = { name = "rex_sub_820900C8" }
 0x82090150 = { name = "rex_sub_82090150" }

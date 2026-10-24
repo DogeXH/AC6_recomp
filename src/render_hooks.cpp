@@ -35,6 +35,15 @@ REXCVAR_DEFINE_DOUBLE(ac6_fps_target, 60.0, "AC6/Enhancements",
                       "Target framerate under the FPS unlock. 0 = auto: the highest "
                       "rate up to ac6_max_sim_fps that evenly divides your monitor's "
                       "refresh rate.");
+REXCVAR_DEFINE_UINT32(ac6_present_max_in_flight, 1, "AC6/Enhancements",
+                      "Maximum reserved-but-unretired guest presents during modern "
+                      "gameplay pacing. 1 preserves existing behavior; 2 opts in to one "
+                      "extra frame of guest/host GPU overlap. Clamped to 1-2.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(ac6_present_overlap_telemetry, false, "AC6/Enhancements",
+                    "Enable aggregate guest-present overlap A/B telemetry. Off by default; "
+                    "may be enabled through normal CVar config or environment overrides.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(ac6_max_sim_fps, 60.0, "AC6/Enhancements",
                       "Ceiling on the simulation rate. The game's physics is only "
                       "validated to 60fps; raise only for testing.");
@@ -97,6 +106,14 @@ static double ResolvePacingTargetFps() {
   }
   // No clean divisor >= 30 (e.g. 50/75Hz): fall back to min(refresh, ceiling).
   return refresh < ceil_fps ? refresh : ceil_fps;
+}
+
+static uint32_t ResolvePresentMaxInFlight() {
+  const uint32_t max_in_flight = REXCVAR_GET(ac6_present_max_in_flight);
+  if (max_in_flight < 1) {
+    return 1;
+  }
+  return max_in_flight > 2 ? 2 : max_in_flight;
 }
 
 namespace {
@@ -316,7 +333,12 @@ void ac6PresentTimingHook(PPCRegister& /*r31*/) {
     override_hz = 1000.0;
     pacing_target_hz = ResolvePacingTargetFps();
   }
+  const uint32_t present_max_in_flight = ResolvePresentMaxInFlight();
   rex::graphics::GraphicsSystem::SetGuestVblankHzOverride(override_hz);
+  rex::graphics::GraphicsSystem::SetGuestPresentTelemetryEnabled(
+      REXCVAR_GET(ac6_present_overlap_telemetry));
+  rex::graphics::GraphicsSystem::SetGuestPresentMaxInFlight(
+      present_max_in_flight);
   rex::graphics::GraphicsSystem::SetGuestPresentPacing(pacing_target_hz);
 
     const auto now = Clock::now();
@@ -334,12 +356,18 @@ void ac6PresentTimingHook(PPCRegister& /*r31*/) {
   // so mode switches log distinctly from plain overrides).
   const double log_key = pacing_target_hz > 0.0 ? -pacing_target_hz : override_hz;
   static double last_log_key = -0.5;
+  static uint32_t last_log_max_in_flight = 0;
   static uint32_t transition_logs = 0;
-  if (unlock && log_key != last_log_key && transition_logs < 32) {
+  const bool in_flight_changed = pacing_target_hz > 0.0 &&
+                                 present_max_in_flight != last_log_max_in_flight;
+  if (unlock && (log_key != last_log_key || in_flight_changed) &&
+      transition_logs < 32) {
     ++transition_logs;
     if (pacing_target_hz > 0.0) {
-      REXLOG_INFO("[AC6-VBLANK] pacing -> modern (present-paced, target {:.0f}fps)",
-                  pacing_target_hz);
+      REXLOG_INFO(
+          "[AC6-VBLANK] pacing -> modern (present-paced, target {:.0f}fps, "
+          "max-in-flight {})",
+          pacing_target_hz, present_max_in_flight);
     } else if (override_hz == 0.0) {
       REXLOG_INFO("[AC6-VBLANK] pacing -> free-run (uncapped)");
     } else {
@@ -347,6 +375,7 @@ void ac6PresentTimingHook(PPCRegister& /*r31*/) {
     }
   }
   last_log_key = log_key;
+  last_log_max_in_flight = present_max_in_flight;
 }
 
 void ac6CinematicTickHook(PPCRegister& /*r3*/) {

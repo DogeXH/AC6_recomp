@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "ac6_backend_fixes/ac6_fullres_effects.h"
+#include "ac6_native_renderer2/native_renderer.h"
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -262,6 +263,10 @@ ac6::d3d::DrawStatsSnapshot SnapshotDrawStats() {
         g_live_stats.set_viewport_calls.load(std::memory_order_relaxed),
         g_live_stats.set_sampler_state_calls.load(std::memory_order_relaxed),
         g_live_stats.set_texture_fetch_calls.load(std::memory_order_relaxed),
+        g_live_stats.set_vertex_shader_calls.load(std::memory_order_relaxed),
+        g_live_stats.set_pixel_shader_calls.load(std::memory_order_relaxed),
+        g_live_stats.set_render_state_calls.load(std::memory_order_relaxed),
+        g_live_stats.set_scissor_calls.load(std::memory_order_relaxed),
         g_live_stats.clear_calls.load(std::memory_order_relaxed),
         g_live_stats.resolve_calls.load(std::memory_order_relaxed),
     };
@@ -281,9 +286,15 @@ void CaptureDrawCall(ac6::d3d::DrawCallKind kind, uint32_t device, uint32_t prim
     record.flags = flags;
     record.shadow_state = SnapshotShadowState(device);
 
-    std::unique_lock<std::shared_mutex> lock(g_capture_mutex);
-    record.sequence = ++g_capture_live_sequence;
-    g_live_draws.push_back(std::move(record));
+    {
+        std::unique_lock<std::shared_mutex> lock(g_capture_mutex);
+        record.sequence = ++g_capture_live_sequence;
+        g_live_draws.push_back(record);
+    }
+    // M3 slice 2: hand every captured draw to the native renderer's one-shot
+    // draw-capture trigger (no-op unless ac6_native_renderer is on and
+    // ac6_native_capture_draw armed it).
+    ac6::nr2::OnDrawCaptured(record);
 }
 
 void CaptureClear(uint8_t* base, uint32_t device, uint32_t rect_count, uint32_t rects_ptr,
@@ -362,6 +373,26 @@ PPC_EXTERN_FUNC(__imp__rex_sub_821DBAF8);  // SetShaderGPRAlloc
 PPC_EXTERN_FUNC(__imp__rex_sub_821E2380);  // Clear
 PPC_EXTERN_FUNC(__imp__rex_sub_821E10C8);  // SetTextureFetchConstant
 PPC_EXTERN_FUNC(__imp__rex_sub_821E2BB8);  // Resolve
+PPC_EXTERN_FUNC(__imp__rex_sub_821DD260);  // SetVertexShader (slot 0-3)
+PPC_EXTERN_FUNC(__imp__rex_sub_821DD5C8);  // SetPixelShader
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAC78);  // SetRenderState_AlphaBlendEnable
+PPC_EXTERN_FUNC(__imp__rex_sub_821DB008);  // SetRenderState_SeparateAlphaBlendEnable
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAD98);  // SetRenderState_SrcBlend
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAE28);  // SetRenderState_DestBlend
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAD08);  // SetRenderState_BlendOp
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAF28);  // SetRenderState_SrcBlendAlpha
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAF98);  // SetRenderState_DestBlendAlpha
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAEB8);  // SetRenderState_BlendOpAlpha
+PPC_EXTERN_FUNC(__imp__rex_sub_821DB330);  // SetRenderState_ZEnable
+PPC_EXTERN_FUNC(__imp__rex_sub_821DB370);  // SetRenderState_ZWriteEnable
+PPC_EXTERN_FUNC(__imp__rex_sub_821DB3A0);  // SetRenderState_ZFunc
+PPC_EXTERN_FUNC(__imp__rex_sub_821DB3D8);  // SetRenderState_StencilEnable
+PPC_EXTERN_FUNC(__imp__rex_sub_821DABE0);  // SetRenderState_CullMode
+PPC_EXTERN_FUNC(__imp__rex_sub_821DAC10);  // SetRenderState_FillMode
+PPC_EXTERN_FUNC(__imp__rex_sub_821DC458);  // SetRenderState_AlphaTestEnable
+PPC_EXTERN_FUNC(__imp__rex_sub_821DC3F0);  // SetRenderState_AlphaFunc
+PPC_EXTERN_FUNC(__imp__rex_sub_821DC4E8);  // SetRenderState_AlphaRef
+PPC_EXTERN_FUNC(__imp__rex_sub_821DCF28);  // SetScissorRect
 
 // D3DDevice_DrawIndexedVertices (0x821DEF18)
 PPC_FUNC_IMPL(rex_sub_821DEF18) {
@@ -856,3 +887,125 @@ ShadowState GetShadowState() {
 }
 
 }  // namespace ac6::d3d
+
+
+// ---------------------------------------------------------------------------
+// M0 native-renderer capture: shader binds + render states (observe mode).
+
+namespace {
+
+void RecordRenderState(uint32_t device, uint32_t ac6::d3d::RenderStateBlock::*field,
+                       uint32_t value, const char* name) {
+    RememberDevice(device);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.render_states.*field = value;
+    }
+    g_live_stats.set_render_state_calls.fetch_add(1, std::memory_order_relaxed);
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetRenderState_{}: value=0x{:X}", name, value);
+    }
+}
+
+}  // namespace
+
+// D3DDevice_SetVertexShader (0x821DD260): r3=device, r4=slot 0-3, r5=pShader.
+PPC_FUNC_IMPL(rex_sub_821DD260) {
+    PPC_FUNC_PROLOGUE();
+
+    uint32_t slot = ctx.r4.u32;
+    uint32_t shader = ctx.r5.u32;
+    RememberDevice(ctx.r3.u32);
+    if (slot < ac6::d3d::kMaxVertexShaderSlots) {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.vertex_shaders[slot] = shader;
+    }
+    g_live_stats.set_vertex_shader_calls.fetch_add(1, std::memory_order_relaxed);
+
+    static std::atomic<bool> logged_once{false};
+    bool expected = false;
+    if (logged_once.compare_exchange_strong(expected, true)) {
+        REXLOG_INFO("[M0] first SetVertexShader observed: slot={} shader=0x{:08X}", slot,
+                    shader);
+    }
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetVertexShader: slot={} shader=0x{:08X}", slot, shader);
+    }
+
+    __imp__rex_sub_821DD260(ctx, base);
+}
+
+// D3DDevice_SetPixelShader (0x821DD5C8): r3=device, r4=pShader.
+PPC_FUNC_IMPL(rex_sub_821DD5C8) {
+    PPC_FUNC_PROLOGUE();
+
+    uint32_t shader = ctx.r4.u32;
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.pixel_shader = shader;
+    }
+    g_live_stats.set_pixel_shader_calls.fetch_add(1, std::memory_order_relaxed);
+
+    static std::atomic<bool> logged_once{false};
+    bool expected = false;
+    if (logged_once.compare_exchange_strong(expected, true)) {
+        REXLOG_INFO("[M0] first SetPixelShader observed: shader=0x{:08X}", shader);
+    }
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetPixelShader: shader=0x{:08X}", shader);
+    }
+
+    __imp__rex_sub_821DD5C8(ctx, base);
+}
+
+#define AC6_RENDER_STATE_HOOK(addr, field, name)                     \
+    PPC_FUNC_IMPL(rex_sub_##addr) {                                  \
+        PPC_FUNC_PROLOGUE();                                         \
+        RecordRenderState(ctx.r3.u32,                                \
+                          &ac6::d3d::RenderStateBlock::field,        \
+                          ctx.r4.u32, name);                         \
+        __imp__rex_sub_##addr(ctx, base);                            \
+    }
+
+AC6_RENDER_STATE_HOOK(821DAC78, alpha_blend_enable, "AlphaBlendEnable")
+AC6_RENDER_STATE_HOOK(821DB008, separate_alpha_blend, "SeparateAlphaBlendEnable")
+AC6_RENDER_STATE_HOOK(821DAD98, src_blend, "SrcBlend")
+AC6_RENDER_STATE_HOOK(821DAE28, dest_blend, "DestBlend")
+AC6_RENDER_STATE_HOOK(821DAD08, blend_op, "BlendOp")
+AC6_RENDER_STATE_HOOK(821DAF28, src_blend_alpha, "SrcBlendAlpha")
+AC6_RENDER_STATE_HOOK(821DAF98, dest_blend_alpha, "DestBlendAlpha")
+AC6_RENDER_STATE_HOOK(821DAEB8, blend_op_alpha, "BlendOpAlpha")
+AC6_RENDER_STATE_HOOK(821DB330, z_enable, "ZEnable")
+AC6_RENDER_STATE_HOOK(821DB370, z_write_enable, "ZWriteEnable")
+AC6_RENDER_STATE_HOOK(821DB3A0, z_func, "ZFunc")
+AC6_RENDER_STATE_HOOK(821DB3D8, stencil_enable, "StencilEnable")
+AC6_RENDER_STATE_HOOK(821DABE0, cull_mode, "CullMode")
+AC6_RENDER_STATE_HOOK(821DAC10, fill_mode, "FillMode")
+AC6_RENDER_STATE_HOOK(821DC458, alpha_test_enable, "AlphaTestEnable")
+AC6_RENDER_STATE_HOOK(821DC3F0, alpha_func, "AlphaFunc")
+AC6_RENDER_STATE_HOOK(821DC4E8, alpha_ref, "AlphaRef")
+#undef AC6_RENDER_STATE_HOOK
+
+// D3DDevice_SetScissorRect (0x821DCF28): r3=device, r4..r7 = l,t,r,b
+// (argument layout inferred from the four word stores at device+12668..12680;
+// verify via ac6_d3d_trace on first captured frame).
+PPC_FUNC_IMPL(rex_sub_821DCF28) {
+    PPC_FUNC_PROLOGUE();
+
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.render_states.scissor.left = ctx.r4.u32;
+        g_shadow.render_states.scissor.top = ctx.r5.u32;
+        g_shadow.render_states.scissor.right = ctx.r6.u32;
+        g_shadow.render_states.scissor.bottom = ctx.r7.u32;
+    }
+    g_live_stats.set_scissor_calls.fetch_add(1, std::memory_order_relaxed);
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetScissorRect: ({},{})-({},{})", ctx.r4.u32, ctx.r5.u32,
+                         ctx.r6.u32, ctx.r7.u32);
+    }
+
+    __imp__rex_sub_821DCF28(ctx, base);
+}

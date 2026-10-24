@@ -13,6 +13,7 @@
 #include <rex/input/input_driver.h>
 #include <rex/ui/window_listener.h>
 
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -55,16 +56,53 @@ class MnkInputDriver final : public InputDriver,
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
  private:
-  uint32_t UserIndex() const;
-  bool IsEnabled() const;
-  void CenterCursor();
-  void UpdateMouseCapture();
+  enum class PadAction : uint8_t {
+    kA,
+    kB,
+    kX,
+    kY,
+    kLeftShoulder,
+    kRightShoulder,
+    kStart,
+    kBack,
+    kLeftThumbPress,
+    kRightThumbPress,
+    kDpadUp,
+    kDpadDown,
+    kDpadLeft,
+    kDpadRight,
+    kLeftTrigger,
+    kRightTrigger,
+    kCount,
+  };
+
+  struct InputConfig {
+    bool enabled = false;
+    uint32_t user_index = 0;
+    double sensitivity = 1.0;
+    std::array<uint16_t, static_cast<size_t>(PadAction::kCount)> action_keys = {};
+    uint16_t guide_key = 0;
+    uint16_t left_stick_up_key = 0;
+    uint16_t left_stick_down_key = 0;
+    uint16_t left_stick_left_key = 0;
+    uint16_t left_stick_right_key = 0;
+  };
+
+  void LoadInputConfig();
+  void CenterCursor(rex::ui::Window* window);
+  void UpdateMouseCapture(bool enabled, bool active);
+  bool ReconcileInputContextLocked(bool active);
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
+  void HandleEdge(PadAction action, uint16_t vk_pad, bool down);
+  void EmitButtonChange(uint16_t host_vk, bool down);
+  void RecomputeLeftStickDirection();
+  void ClearInputState();
 
   rex::ui::Window* attached_window_ = nullptr;
 
   std::mutex state_mutex_;
+  InputConfig input_config_;
   bool key_down_[256] = {};
 
   // Mouse delta tracking
@@ -77,6 +115,8 @@ class MnkInputDriver final : public InputDriver,
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
+  std::array<bool, static_cast<size_t>(PadAction::kCount)> pad_action_down_ = {};
+  uint16_t left_stick_direction_vk_pad_ = 0;
 
   // Packet number incremented on state change
   uint32_t packet_number_ = 0;

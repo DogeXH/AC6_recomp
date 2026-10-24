@@ -1,0 +1,15 @@
+Microsoft C/C++ runtime (statically linked, /MT)
+
+ac6recomp.exe is built with clang + lld-link against the MSVC 14.44.35220 CRT/STL and the
+Windows SDK 10.0.26100 (obtained with xwin, which downloads them from Microsoft and requires
+accepting Microsoft's license terms). The exe statically contains:
+
+- the Universal CRT (libucrt.lib) and vcruntime (libvcruntime.lib, libcmt.lib): Microsoft
+  "Distributable Code" under the Microsoft Visual Studio / Build Tools license terms; no
+  notice text is required in the redistributed program.
+- the Microsoft C++ Standard Library (libcpmt.lib): https://github.com/microsoft/STL,
+  licensed under the Apache License v2.0 with LLVM Exception. Under the LLVM Exception,
+  the attribution requirements do not apply to object code produced by compiling it.
+
+clang's builtin headers (intrinsics) are Apache-2.0 WITH LLVM-exception; same exception.
+No Microsoft DLLs (VC++ redistributable) are shipped: the exe imports only Windows system DLLs.

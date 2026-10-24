@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>AC6 lobby admin</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23101418'/%3E%3Cpath d='M16 6 26 25H6Z' fill='none' stroke='%2353c6e6' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form id="login-form" class="login-card" autocomplete="off">
+    <div class="brand"><span class="mark" aria-hidden="true"></span>AC6 lobby <span class="brand-sub">moderation</span></div>
+    <p class="login-lead">Paste the admin token. It is in <code>admin.token</code> in the server's data directory
+      (<code>sudo cat /var/lib/ac6lobby/admin.token</code>).</p>
+    <label class="field">
+      <span>Admin token</span>
+      <input id="token-input" type="password" spellcheck="false" autocapitalize="off" required minlength="32">
+    </label>
+    <label class="check"><input id="remember" type="checkbox"> Remember in this browser</label>
+    <p id="login-error" class="form-error" role="alert"></p>
+    <button type="submit" class="btn primary block" id="login-btn">Unlock</button>
+    <p class="fine">The token stays in this browser and is sent only to this server. Without
+      "Remember", it is forgotten when the tab closes.</p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand"><span class="mark" aria-hidden="true"></span>AC6 lobby <span class="brand-sub">moderation</span></div>
+    <div class="conn" id="conn"><span class="dot" aria-hidden="true"></span><span id="conn-text">Connecting…</span></div>
+    <div class="meta" id="meta"></div>
+    <button type="button" class="btn ghost small" id="lock-btn">Lock</button>
+  </header>
+
+  <section class="tiles" id="tiles" aria-label="Server figures"></section>
+
+  <div class="layout">
+    <main class="main">
+      <div class="tabbar">
+        <nav class="tabs" role="tablist" aria-label="Views">
+          <button type="button" role="tab" data-tab="players">Players <span class="count" data-count="players"></span></button>
+          <button type="button" role="tab" data-tab="sessions">Sessions <span class="count" data-count="sessions"></span></button>
+          <button type="button" role="tab" data-tab="bans">Bans <span class="count" data-count="bans"></span></button>
+          <button type="button" role="tab" data-tab="audit">Audit log</button>
+          <button type="button" role="tab" data-tab="metrics">Metrics</button>
+        </nav>
+        <input type="search" id="filter" class="filter" placeholder="Filter by gamertag or peer ID" aria-label="Filter">
+      </div>
+      <section class="panel" role="tabpanel" id="view"></section>
+    </main>
+
+    <aside class="side">
+      <section class="card">
+        <h2>Account</h2>
+        <p class="hint">Act on any account, online or not.</p>
+        <label class="field">
+          <span>Gamertag or peer ID</span>
+          <input id="who" type="text" spellcheck="false" autocapitalize="off" maxlength="64" placeholder="Pixy or 0123456789abcdef">
+        </label>
+        <div class="btn-grid">
+          <button type="button" class="btn" data-who="kick">Kick…</button>
+          <button type="button" class="btn danger-soft" data-who="ban">Ban…</button>
+          <button type="button" class="btn" data-who="unban">Unban…</button>
+          <button type="button" class="btn danger-soft" data-who="forget">Delete…</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Broadcast</h2>
+        <p class="hint">Every online game logs the message. It is not shown in the game.</p>
+        <form id="broadcast-form">
+          <label class="field">
+            <span class="field-row"><span>Message</span><span class="counter" id="bc-count">0 / 300</span></span>
+            <textarea id="bc-msg" rows="3" maxlength="300" placeholder="Restarting in 5 minutes"></textarea>
+          </label>
+          <button type="submit" class="btn primary block" id="bc-btn" disabled>Send</button>
+        </form>
+      </section>
+
+      <section class="card quiet">
+        <h2>Notes</h2>
+        <ul class="notes">
+          <li>Every kick, ban, unban, broadcast, delete and IP lookup goes into the audit log.</li>
+          <li>Bans apply to the account key and survive restarts.</li>
+          <li>IP addresses are personal data. Look one up only when you need it.</li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<div id="sheet-backdrop" class="backdrop" hidden>
+  <div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title"></div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

@@ -29,7 +29,12 @@
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
 
-REXCVAR_DECLARE(bool, ac6_fix_trails);  // defined in graphics/flags.cpp
+// Keep storage in the lowest-level consumer. rexgraphics depends on rexsystem,
+// so defining this in rexgraphics creates a reverse static-archive dependency.
+REXCVAR_DEFINE_BOOL(ac6_fix_trails, true, "AC6/Fixes",
+                    "Fix invisible missile and jet trails by refreshing the GPU copy "
+                    "of the trail history when the CPU rewrites it.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 

@@ -22,6 +22,8 @@ extern "C" {
 
 REXCVAR_DECLARE(bool, ffmpeg_verbose);
 
+REXCVAR_DECLARE(bool, audio_xma_synchronous_kick);
+
 namespace rex::audio {
 
 namespace {
@@ -179,6 +181,15 @@ bool XmaDecoder::IsManagedContextPointer(const uint32_t guest_ptr) const {
   return context_id < kContextCount && contexts_[context_id].is_allocated();
 }
 
+
+std::unique_lock<std::mutex> XmaDecoder::LockContextForGuestWrite(const uint32_t guest_ptr) {
+  const int context_id = GetContextId(guest_ptr);
+  if (context_id < 0) {
+    return {};
+  }
+  return std::unique_lock<std::mutex>(contexts_[context_id].guest_lock());
+}
+
 XMA_CONTEXT_DATA* XmaDecoder::TranslateManagedContext(const uint32_t guest_ptr,
                                                       const char* caller) const {
   if (!IsManagedContextPointer(guest_ptr)) {
@@ -303,6 +314,7 @@ X_STATUS XmaDecoder::InitializeContext(const uint32_t guest_ptr, const XmaContex
     return X_E_FALSE;
   }
 
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_0_ptr = input_buffer_0_physical_address;
@@ -333,6 +345,7 @@ X_STATUS XmaDecoder::SetLoopData(const uint32_t guest_ptr, const XmaLoopData& lo
     return X_E_INVALIDARG;
   }
 
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   XMA_CONTEXT_DATA context(context_ptr);
   context.loop_start = loop_data.loop_start;
   context.loop_end = loop_data.loop_end;
@@ -356,6 +369,7 @@ X_STATUS XmaDecoder::SetInputBufferReadOffset(const uint32_t guest_ptr, const ui
   if (!context_ptr) {
     return X_E_INVALIDARG;
   }
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   XMA_CONTEXT_DATA context(context_ptr);
   context.input_buffer_read_offset = value;
   context.Store(context_ptr);
@@ -375,6 +389,7 @@ X_STATUS XmaDecoder::SetInputBuffer(const uint32_t guest_ptr, const uint32_t buf
     return X_E_FALSE;
   }
 
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   XMA_CONTEXT_DATA context(context_ptr);
   if (buffer_index == 0) {
     context.input_buffer_0_ptr = buffer_physical_address;
@@ -403,6 +418,7 @@ X_STATUS XmaDecoder::SetInputBufferValid(const uint32_t guest_ptr, const uint8_t
     return X_E_INVALIDARG;
   }
 
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   XMA_CONTEXT_DATA context(context_ptr);
   if (buffer_index == 0) {
     context.input_buffer_0_valid = 1;
@@ -427,6 +443,7 @@ X_STATUS XmaDecoder::SetOutputBufferValid(const uint32_t guest_ptr) {
     return X_E_INVALIDARG;
   }
 
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   XMA_CONTEXT_DATA context(context_ptr);
   context.output_buffer_valid = 1;
   context.Store(context_ptr);
@@ -447,6 +464,7 @@ X_STATUS XmaDecoder::SetOutputBufferReadOffset(const uint32_t guest_ptr, const u
     return X_E_INVALIDARG;
   }
 
+  const auto guest_guard = LockContextForGuestWrite(guest_ptr);
   XMA_CONTEXT_DATA context(context_ptr);
   context.output_buffer_read_offset = value;
   context.Store(context_ptr);
@@ -541,10 +559,14 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       }
     }
     work_event_->Set();
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        contexts_[context_id].WaitForWorkDone();
+    if (REXCVAR_GET(audio_xma_synchronous_kick)) {
+      // Legacy synchronous handshake: stalls the guest thread for the whole
+      // decode pass (all kicked contexts). Real hardware kicks are async.
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          uint32_t context_id = base_context_id + i;
+          contexts_[context_id].WaitForWorkDone();
+        }
       }
     }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {

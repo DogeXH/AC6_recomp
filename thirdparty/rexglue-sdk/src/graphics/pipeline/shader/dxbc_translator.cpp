@@ -152,6 +152,9 @@ uint64_t DxbcShaderTranslator::GetDefaultVertexShaderModification(
       dynamic_addressable_register_count;
   shader_modification.vertex.host_vertex_shader_type = host_vertex_shader_type;
   shader_modification.vertex.interpolator_mask = (UINT32_C(1) << xenos::kMaxInterpolators) - 1;
+  if (REXCVAR_GET(vfetch_index_rounding_bias)) {
+    shader_modification.value |= Modification::kVfetchIndexRoundingBiasMask;
+  }
   return shader_modification.value;
 }
 
@@ -161,6 +164,9 @@ uint64_t DxbcShaderTranslator::GetDefaultPixelShaderModification(
   shader_modification.pixel.dynamic_addressable_register_count = dynamic_addressable_register_count;
   shader_modification.pixel.interpolator_mask = (UINT32_C(1) << xenos::kMaxInterpolators) - 1;
   shader_modification.pixel.depth_stencil_mode = Modification::DepthStencilMode::kNoModifiers;
+  if (REXCVAR_GET(vfetch_index_rounding_bias)) {
+    shader_modification.value |= Modification::kVfetchIndexRoundingBiasMask;
+  }
   return shader_modification.value;
 }
 

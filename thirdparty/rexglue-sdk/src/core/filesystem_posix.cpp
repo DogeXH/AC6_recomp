@@ -151,14 +151,14 @@ class PosixFileHandle : public FileHandle {
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
     ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_read = out;
-    return out >= 0 ? true : false;
+    *out_bytes_read = out >= 0 ? static_cast<size_t>(out) : 0;
+    return out >= 0;
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_written = out;
-    return out >= 0 ? true : false;
+    *out_bytes_written = out >= 0 ? static_cast<size_t>(out) : 0;
+    return out >= 0;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
@@ -169,25 +169,14 @@ class PosixFileHandle : public FileHandle {
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
                                                      uint32_t desired_access) {
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
+  // POSIX access modes are alternatives, not independent bits (O_RDONLY is 0).
+  const bool read = desired_access &
+      (FileAccess::kGenericRead | FileAccess::kGenericExecute |
+       FileAccess::kGenericAll | FileAccess::kFileReadData);
+  const bool write = desired_access &
+      (FileAccess::kGenericWrite | FileAccess::kGenericAll |
+       FileAccess::kFileWriteData | FileAccess::kFileAppendData);
+  int open_access = write ? (read ? O_RDWR : O_WRONLY) : O_RDONLY;
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= O_APPEND;
   }

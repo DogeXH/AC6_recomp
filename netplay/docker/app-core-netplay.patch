@@ -1,0 +1,367 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4a52adbf..b7c296ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -88,8 +88,21 @@ endif()
+ # inert unless the runtime config sets [netplay] enabled = true.
+ add_subdirectory(netplay/core)
+ if(TARGET rexruntime)
++    # macOS SDK fork: kernel + system are one shared runtime.
+     target_link_libraries(rexruntime PRIVATE ac6net)
+     target_compile_definitions(rexruntime PRIVATE REX_HAVE_AC6NET=1)
++elseif(TARGET rexkernel AND TARGET rexsystem)
++    # Vendored SDK (Linux/Steam Deck, Windows): the XAM glue builds into the static rexkernel
++    # and kernel_state.cpp into the static rexsystem. A PRIVATE link on a static library still
++    # propagates ac6net (and ws2_32/iphlpapi/bcrypt on Windows) to the final executable.
++    # Set AC6_NETPLAY=OFF to build exactly the old runtime (no glue compiled in).
++    option(AC6_NETPLAY "Compile the AC6 online glue into the vendored SDK" ON)
++    if(AC6_NETPLAY)
++        foreach(_ac6net_target rexkernel rexsystem)
++            target_link_libraries(${_ac6net_target} PRIVATE ac6net)
++            target_compile_definitions(${_ac6net_target} PRIVATE REX_HAVE_AC6NET=1)
++        endforeach()
++    endif()
+ endif()
+ 
+ # Link libmspack for AC6 PAC LZX decompression in the runtime dump path.
+@@ -97,7 +110,11 @@ target_link_libraries(ac6recomp PRIVATE mspack)
+ 
+ # The generated 0.9 integration links the runtime, while AC6's host hooks also
+ # reference symbols exported directly by the Xenos GPU plugin.
+-target_link_libraries(ac6recomp PRIVATE rex::gpu-xenos)
++# The vendored 0.8 SDK (Linux/Windows) has no separate GPU plugin: rexglue_bootstrap.cmake links
++# rex::graphics into the executable instead.
++if(TARGET rex::gpu-xenos)
++    target_link_libraries(ac6recomp PRIVATE rex::gpu-xenos)
++endif()
+ target_include_directories(ac6recomp PRIVATE ${REXSDK_DIR}/thirdparty/imgui)
+ 
+ if(AC6RECOMP_IPO_SUPPORTED)
+diff --git a/netplay/core/CMakeLists.txt b/netplay/core/CMakeLists.txt
+index f33f231d..85729b69 100644
+--- a/netplay/core/CMakeLists.txt
++++ b/netplay/core/CMakeLists.txt
+@@ -26,15 +26,16 @@ file(GLOB AC6NET_THIRD_PARTY_C CONFIGURE_DEPENDS
+ 
+ add_library(ac6net STATIC ${AC6NET_SOURCES} ${AC6NET_THIRD_PARTY_C})
+ set_target_properties(ac6net PROPERTIES POSITION_INDEPENDENT_CODE ON)
++# src/ is deliberately not an include directory: its headers are included as siblings ("x.h"),
++# and src/qos.h would otherwise shadow the Windows SDK <qos.h> that <winsock2.h> includes.
+ target_include_directories(ac6net
+   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+-          ${CMAKE_CURRENT_SOURCE_DIR}/third_party
++  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+ )
+ find_package(Threads REQUIRED)
+ target_link_libraries(ac6net PUBLIC Threads::Threads)
+ if(WIN32)
+-  target_link_libraries(ac6net PUBLIC ws2_32 iphlpapi bcrypt)
++  target_link_libraries(ac6net PUBLIC ws2_32 iphlpapi bcrypt winmm)
+ endif()
+ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+   # The parent project builds with -w; keep our own code warning-clean when standalone.
+@@ -47,9 +48,15 @@ if(AC6NET_BUILD_TESTS)
+   file(GLOB AC6NET_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+   add_executable(ac6net_tests ${AC6NET_TEST_SOURCES})
+   target_include_directories(ac6net_tests PRIVATE
+-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+   )
++  # The tests include src/ headers with quotes. -iquote keeps src/qos.h from shadowing the
++  # Windows SDK <qos.h> (pulled in by <winsock2.h>); compilers without it get a plain -I.
++  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
++    target_compile_options(ac6net_tests PRIVATE "SHELL:-iquote ${CMAKE_CURRENT_SOURCE_DIR}/src")
++  else()
++    target_include_directories(ac6net_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++  endif()
+   target_link_libraries(ac6net_tests PRIVATE ac6net)
+ endif()
+diff --git a/netplay/core/cmake/mingw-w64-x86_64.cmake b/netplay/core/cmake/mingw-w64-x86_64.cmake
+new file mode 100644
+index 00000000..d85d589a
+--- /dev/null
++++ b/netplay/core/cmake/mingw-w64-x86_64.cmake
+@@ -0,0 +1,16 @@
++# Cross-compile ac6net for Windows x86-64 with MinGW-w64 (portability check only).
++#   cmake -S netplay/core -B out/ac6net-mingw -G Ninja \
++#     -DCMAKE_TOOLCHAIN_FILE=netplay/core/cmake/mingw-w64-x86_64.cmake -DAC6NET_BUILD_TESTS=ON
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_PROCESSOR x86_64)
++set(_mingw_prefix x86_64-w64-mingw32)
++find_program(CMAKE_C_COMPILER NAMES ${_mingw_prefix}-gcc PATHS /opt/homebrew/bin /usr/bin REQUIRED)
++find_program(CMAKE_CXX_COMPILER NAMES ${_mingw_prefix}-g++ PATHS /opt/homebrew/bin /usr/bin REQUIRED)
++find_program(CMAKE_RC_COMPILER NAMES ${_mingw_prefix}-windres PATHS /opt/homebrew/bin /usr/bin)
++find_program(CMAKE_AR NAMES ${_mingw_prefix}-ar PATHS /opt/homebrew/bin /usr/bin REQUIRED)
++find_program(CMAKE_RANLIB NAMES ${_mingw_prefix}-ranlib PATHS /opt/homebrew/bin /usr/bin REQUIRED)
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++# Static runtime so the test exe runs under Wine without the MinGW DLLs on PATH.
++set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -static-libgcc -static-libstdc++")
+diff --git a/netplay/core/include/ac6net/log.h b/netplay/core/include/ac6net/log.h
+index a7d716bb..8e8f2a5d 100644
+--- a/netplay/core/include/ac6net/log.h
++++ b/netplay/core/include/ac6net/log.h
+@@ -15,7 +15,11 @@ void SetLogSink(LogSink sink);
+ 
+ // printf-style logging.
+ void LogF(LogLevel level, const char* fmt, ...)
+-#if defined(__GNUC__) || defined(__clang__)
++#if defined(__MINGW32__)
++    // MinGW's plain `printf` archetype is msvcrt's (no %zu/%lld); log.cpp formats with the
++    // C99-conforming __mingw_vsnprintf there.
++    __attribute__((format(gnu_printf, 2, 3)))
++#elif defined(__GNUC__) || defined(__clang__)
+     __attribute__((format(printf, 2, 3)))
+ #endif
+     ;
+diff --git a/netplay/core/src/identity.cpp b/netplay/core/src/identity.cpp
+index 03cf011a..651b4d47 100644
+--- a/netplay/core/src/identity.cpp
++++ b/netplay/core/src/identity.cpp
+@@ -198,6 +198,7 @@ bool LoadOrCreateIdentity(const std::string& data_dir, IdentityFile* out, std::s
+     // identity.json is tiny; anything large is not ours.
+     const std::string text = ss.str().size() <= 64 * 1024 ? ss.str() : std::string();
+     if (f && ParseIdentity(text, out)) return true;
++    f.close();  // Windows cannot rename a file that is still open
+     fs::path aside = path;
+     aside += ".corrupt";
+     fs::rename(path, aside, ec);
+diff --git a/netplay/core/src/log.cpp b/netplay/core/src/log.cpp
+index ddb67df5..f526d2e9 100644
+--- a/netplay/core/src/log.cpp
++++ b/netplay/core/src/log.cpp
+@@ -8,6 +8,13 @@
+ #include <mutex>
+ #include <string>
+ 
++// MinGW: msvcrt's vsnprintf does not understand C99 length modifiers such as %zu.
++#if defined(__MINGW32__)
++#define AC6NET_VSNPRINTF __mingw_vsnprintf
++#else
++#define AC6NET_VSNPRINTF std::vsnprintf
++#endif
++
+ namespace ac6net {
+ 
+ namespace {
+@@ -63,7 +70,7 @@ void LogF(LogLevel level, const char* fmt, ...) {
+   va_start(args, fmt);
+   va_list args_copy;
+   va_copy(args_copy, args);
+-  const int n = std::vsnprintf(stack_buf, sizeof(stack_buf), fmt, args);
++  const int n = AC6NET_VSNPRINTF(stack_buf, sizeof(stack_buf), fmt, args);
+   va_end(args);
+ 
+   std::string message;
+@@ -73,7 +80,7 @@ void LogF(LogLevel level, const char* fmt, ...) {
+     message.assign(stack_buf, static_cast<size_t>(n));
+   } else {
+     message.resize(static_cast<size_t>(n) + 1);
+-    std::vsnprintf(message.data(), message.size(), fmt, args_copy);
++    AC6NET_VSNPRINTF(message.data(), message.size(), fmt, args_copy);
+     message.resize(static_cast<size_t>(n));
+   }
+   va_end(args_copy);
+diff --git a/netplay/core/src/overlay.cpp b/netplay/core/src/overlay.cpp
+index 9cd6418e..1c97753d 100644
+--- a/netplay/core/src/overlay.cpp
++++ b/netplay/core/src/overlay.cpp
+@@ -457,6 +457,7 @@ void Overlay::SetTestDropServerControl(bool drop) { impl_->drop_server_control =
+ // --- Impl: network thread ---
+ 
+ void Overlay::Impl::ThreadMain() {
++  const net::ScopedTimerResolution timer_resolution;  // Windows only: 1 ms timer for the loop
+   while (!stop_requested.load()) {
+     uint64_t now = OverlayNowMs();
+     bool resolve = false;
+diff --git a/netplay/core/src/overlay_net.cpp b/netplay/core/src/overlay_net.cpp
+index ba235b51..399bd07f 100644
+--- a/netplay/core/src/overlay_net.cpp
++++ b/netplay/core/src/overlay_net.cpp
+@@ -7,6 +7,11 @@
+ #if defined(_WIN32)
+ #include <iphlpapi.h>
+ #include <mstcpip.h>
++#include <mswsock.h>  // SIO_UDP_CONNRESET on MinGW-w64 (the Windows SDK has it in mstcpip.h)
++#include <mmsystem.h>  // timeBeginPeriod (winmm)
++#ifndef SIO_UDP_CONNRESET
++#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
++#endif
+ #else
+ #include <arpa/inet.h>
+ #include <errno.h>
+@@ -434,4 +439,14 @@ std::vector<Addr> LocalAddresses(bool want_v4, bool want_v6) {
+   return out;
+ }
+ 
++#if defined(_WIN32)
++ScopedTimerResolution::ScopedTimerResolution() : active_(timeBeginPeriod(1) == TIMERR_NOERROR) {}
++ScopedTimerResolution::~ScopedTimerResolution() {
++  if (active_) timeEndPeriod(1);
++}
++#else
++ScopedTimerResolution::ScopedTimerResolution() = default;
++ScopedTimerResolution::~ScopedTimerResolution() = default;
++#endif
++
+ }  // namespace ac6net::net
+diff --git a/netplay/core/src/overlay_net.h b/netplay/core/src/overlay_net.h
+index a0a9c66c..46331a93 100644
+--- a/netplay/core/src/overlay_net.h
++++ b/netplay/core/src/overlay_net.h
+@@ -81,6 +81,20 @@ class UdpSocket {
+ // readable[i] is set for each ready socket. Returns false if none became ready.
+ bool PollReadable(UdpSocket* const* socks, size_t n, int timeout_ms, bool* readable);
+ 
++// Windows: raises the process timer resolution to 1 ms while alive (timeBeginPeriod), so the
++// ~5 ms network loop does not round its poll timeout up to the 15.6 ms default tick. No-op on
++// other platforms.
++class ScopedTimerResolution {
++ public:
++  ScopedTimerResolution();
++  ~ScopedTimerResolution();
++  ScopedTimerResolution(const ScopedTimerResolution&) = delete;
++  ScopedTimerResolution& operator=(const ScopedTimerResolution&) = delete;
++
++ private:
++  bool active_ = false;
++};
++
+ // Resolves "host:port", "[v6]:port" or "v4:port". Prefers an IPv4 result.
+ bool ResolveHostPort(const std::string& host_port, Addr* out, std::string* error);
+ 
+diff --git a/netplay/core/tests/netplay_helpers_test.cpp b/netplay/core/tests/netplay_helpers_test.cpp
+index fba0ed44..f047b96e 100644
+--- a/netplay/core/tests/netplay_helpers_test.cpp
++++ b/netplay/core/tests/netplay_helpers_test.cpp
+@@ -117,11 +117,13 @@ TEST_CASE("identity: create, reload, registration cache, mode 0600, corrupt file
+   CHECK(id.pk == crypto::PublicKeyFromSecret(id.sk));
+   const std::string path = dir + "/identity.json";
+   REQUIRE(fs::exists(path));
++#if !defined(_WIN32)  // POSIX permission bits; Windows has no 0600/0700 modes
+   struct stat st {};
+   REQUIRE(::stat(path.c_str(), &st) == 0);
+   CHECK((st.st_mode & 0777) == 0600);
+   REQUIRE(::stat(dir.c_str(), &st) == 0);
+   CHECK((st.st_mode & 0777) == 0700);
++#endif
+ 
+   IdentityFile again;
+   REQUIRE(LoadOrCreateIdentity(dir, &again, &err));
+@@ -134,8 +136,10 @@ TEST_CASE("identity: create, reload, registration cache, mode 0600, corrupt file
+   id.vip = 0x0A400007;
+   id.gamertag = "Talisman \"T\"";
+   REQUIRE(SaveIdentity(dir, id, &err));
++#if !defined(_WIN32)
+   REQUIRE(::stat(path.c_str(), &st) == 0);
+   CHECK((st.st_mode & 0777) == 0600);
++#endif
+   IdentityFile loaded;
+   REQUIRE(LoadOrCreateIdentity(dir, &loaded, &err));
+   CHECK(loaded.sk == id.sk);
+diff --git a/netplay/core/tests/overlay_test_util.h b/netplay/core/tests/overlay_test_util.h
+index 83412bbb..a6410561 100644
+--- a/netplay/core/tests/overlay_test_util.h
++++ b/netplay/core/tests/overlay_test_util.h
+@@ -21,11 +21,20 @@
+ #include <thread>
+ #include <vector>
+ 
++#if !defined(_WIN32)
+ #include <fcntl.h>
+ #include <signal.h>
+ #include <spawn.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#define AC6NET_TEST_CAN_SPAWN 1
++using ServerPid = pid_t;
++#else
++using ServerPid = long long;
++// Windows: the self-started server (posix_spawn) is not ported; [server] tests need an external
++// server there (AC6NET_TEST_SERVER + AC6NET_TEST_SERVER_KEY). Restart tests are skipped.
++#define AC6NET_TEST_CAN_SPAWN 0
++#endif
+ 
+ #include "ac6net/config.h"
+ #include "ac6net/netplay.h"
+@@ -33,7 +42,9 @@
+ #include "mini_test.h"
+ #include "overlay.h"
+ 
++#if AC6NET_TEST_CAN_SPAWN
+ extern char** environ;
++#endif
+ 
+ namespace overlay_test {
+ 
+@@ -82,13 +93,16 @@ class TestServer {
+ 
+   // True if [server] tests can run at all.
+   static bool Available() {
+-    return mini_test::Env("AC6NET_TEST_SERVER_BIN") ||
++    return (AC6NET_TEST_CAN_SPAWN && mini_test::Env("AC6NET_TEST_SERVER_BIN")) ||
+            (mini_test::Env("AC6NET_TEST_SERVER") && mini_test::Env("AC6NET_TEST_SERVER_KEY"));
+   }
+-  static bool CanRestart() { return mini_test::Env("AC6NET_TEST_SERVER_BIN") != nullptr; }
++  static bool CanRestart() {
++    return AC6NET_TEST_CAN_SPAWN && mini_test::Env("AC6NET_TEST_SERVER_BIN") != nullptr;
++  }
+ 
+   bool Start() {
+-    if (const char* bin = mini_test::Env("AC6NET_TEST_SERVER_BIN")) {
++    const char* bin = AC6NET_TEST_CAN_SPAWN ? mini_test::Env("AC6NET_TEST_SERVER_BIN") : nullptr;
++    if (bin) {
+       bin_ = bin;
+       if (data_dir_.empty()) data_dir_ = MakeTempDir("server");
+       return Spawn();
+@@ -101,6 +115,7 @@ class TestServer {
+   // graceful: SIGTERM (the server sends a shutdown NOTICE); otherwise SIGKILL (no notice).
+   void Stop(bool graceful = true) {
+     if (pid_ <= 0) return;
++#if AC6NET_TEST_CAN_SPAWN
+     ::kill(pid_, graceful ? SIGTERM : SIGKILL);
+     int status = 0;
+     for (int i = 0; i < 300; ++i) {
+@@ -112,6 +127,7 @@ class TestServer {
+     }
+     ::kill(pid_, SIGKILL);
+     ::waitpid(pid_, &status, 0);
++#endif
+     pid_ = -1;
+   }
+ 
+@@ -123,10 +139,14 @@ class TestServer {
+   const std::string& addr() const { return addr_; }
+   std::string log_path() const { return data_dir_.empty() ? "" : data_dir_ + "/server.log"; }
+   const std::string& key() const { return key_; }
+-  pid_t pid() const { return pid_; }
++  ServerPid pid() const { return pid_; }
+ 
+  private:
+   bool Spawn() {
++#if !AC6NET_TEST_CAN_SPAWN
++    std::fprintf(stderr, "  self-started test server is not supported on this platform\n");
++    return false;
++#else
+     addr_ = "127.0.0.1:" + std::to_string(kServerPort);
+     const std::string data_arg = data_dir_;
+     std::vector<std::string> args = {bin_, "-data", data_arg, "-udp", addr_, "-http", "",
+@@ -168,13 +188,14 @@ class TestServer {
+     key_ = Trim(ReadFile(pub));
+     SleepMs(150);  // let it bind the UDP socket
+     return true;
++#endif
+   }
+ 
+   std::string bin_;
+   std::string data_dir_;
+   std::string addr_;
+   std::string key_;
+-  pid_t pid_ = -1;
++  ServerPid pid_ = -1;
+ };
+ 
+ struct Received {

@@ -78,19 +78,30 @@ void TracePlayer::SeekCommand(int target_command) {
   }
 }
 
+void TracePlayer::ReplayRange(const uint8_t* trace_data, size_t trace_size,
+                              bool skip_memory_reads) {
+  PlayTrace(trace_data, trace_size, TracePlaybackMode::kUntilEnd, false,
+            skip_memory_reads);
+}
+
 void TracePlayer::WaitOnPlayback() {
   rex::thread::Wait(playback_event_.get(), true);
 }
 
 void TracePlayer::PlayTrace(const uint8_t* trace_data, size_t trace_size,
-                            TracePlaybackMode playback_mode, bool clear_caches) {
+                            TracePlaybackMode playback_mode, bool clear_caches,
+                            bool skip_memory_reads) {
   playing_trace_ = true;
   graphics_system_->command_processor()->CallInThread(
-      [=]() { PlayTraceOnThread(trace_data, trace_size, playback_mode, clear_caches); });
+      [=, this]() {
+        PlayTraceOnThread(trace_data, trace_size, playback_mode, clear_caches,
+                          skip_memory_reads);
+      });
 }
 
 void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size,
-                                    TracePlaybackMode playback_mode, bool clear_caches) {
+                                    TracePlaybackMode playback_mode, bool clear_caches,
+                                    bool skip_memory_reads) {
   auto memory = graphics_system_->memory();
   auto command_processor = graphics_system_->command_processor();
 
@@ -159,10 +170,14 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
       case TraceCommandType::kMemoryRead: {
         auto cmd = reinterpret_cast<const MemoryCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
-        DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
-                         memory->TranslatePhysical(cmd->base_ptr), cmd->decoded_length);
+        if (!skip_memory_reads) {
+          DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
+                           memory->TranslatePhysical(cmd->base_ptr), cmd->decoded_length);
+        }
         trace_ptr += cmd->encoded_length;
-        command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
+        if (!skip_memory_reads) {
+          command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
+        }
         break;
       }
       case TraceCommandType::kMemoryWrite: {

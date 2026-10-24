@@ -110,6 +110,132 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
 
+  // Restart-scoped, opt-in diagnostics for the exact AC6 640x720-per-tile
+  // world render-target family. This is intentionally aggregate-only so the
+  // diagnostic doesn't perturb render-target ordering or emit per-draw logs.
+  // Consumed by VulkanCommandProcessor at the guest swap boundary.
+  static constexpr uint32_t kAc6WorldTransferDetailCapacity = 32;
+  static constexpr uint32_t kAc6WorldClosureAttachmentCapacity = 256;
+  static constexpr uint32_t kAc6WorldClosureTransferCapacity = 256;
+
+  // A candidate-involving logical ownership transfer, captured only by the
+  // stricter AC6_WORLD_SCALE_TRANSFER_DETAIL restart gate. RenderTargetKey is
+  // stored in its raw packed form: base[10:0], pitch[18:11], msaa[20:19],
+  // depth[21], and resource format[25:22]. A zero key denotes a null endpoint.
+  struct Ac6WorldTransferDetail {
+    uint64_t sequence_index = 0;
+    uint64_t call_index = 0;
+    uint32_t attachment_slot = 0;
+    uint32_t start_tiles = 0;
+    uint32_t end_tiles = 0;
+    uint32_t dest_key = 0;
+    uint32_t source_key = 0;
+    uint32_t host_depth_key = 0;
+    // 0 = null endpoint, 1 = color endpoint, 2 = depth endpoint.
+    uint8_t dest_candidate = 0;
+    uint8_t source_candidate = 0;
+    uint8_t host_depth_candidate = 0;
+    uint8_t dest_kind = 0;
+    uint8_t source_kind = 0;
+    uint8_t host_depth_kind = 0;
+  };
+
+  // Restart-scoped generic closure detail. Unlike Ac6WorldTransferDetail,
+  // these records aren't filtered to the exact AC6 world family. They retain
+  // the unique closure-relevant hyperedges seen during a swap, with duplicate
+  // observations folded into occurrences. Presence masks keep a valid raw
+  // zero RenderTargetKey distinguishable from a null endpoint.
+  struct Ac6WorldClosureAttachmentDetail {
+    uint64_t sequence_index = 0;
+    uint64_t first_update_index = 0;
+    uint64_t occurrences = 0;
+    uint32_t used_mask = 0;
+    std::array<uint32_t, 1 + xenos::kMaxColorRenderTargets> keys = {};
+  };
+
+  struct Ac6WorldClosureTransferDetail {
+    uint64_t sequence_index = 0;
+    uint64_t first_call_index = 0;
+    uint64_t occurrences = 0;
+    uint32_t attachment_slot = 0;
+    // Bit 0 = destination, bit 1 = regular source, bit 2 = host-depth source.
+    uint32_t endpoint_mask = 0;
+    uint32_t dest_key = 0;
+    uint32_t source_key = 0;
+    uint32_t host_depth_key = 0;
+  };
+
+  struct Ac6WorldIdentityTelemetry {
+    uint64_t candidate_attachment_sets = 0;
+    uint64_t candidate_attachment_sets_color_depth = 0;
+    uint64_t candidate_attachment_sets_missing_pair = 0;
+    uint64_t candidate_attachment_sets_mixed = 0;
+    uint64_t candidate_attachment_nonworld_targets = 0;
+    uint64_t candidate_attachment_surface_aliases = 0;
+    uint64_t candidate_attachment_color_aliases = 0;
+    uint64_t candidate_transfer_calls = 0;
+    uint64_t candidate_transfer_calls_mixed = 0;
+    uint64_t candidate_transfer_invocations = 0;
+    uint64_t candidate_transfer_range_tiles = 0;
+    uint64_t candidate_transfer_dest = 0;
+    uint64_t candidate_transfer_source = 0;
+    uint64_t candidate_transfer_host_depth_source = 0;
+    uint64_t candidate_transfer_cross_family = 0;
+    uint64_t candidate_transfer_cross_kind = 0;
+    uint64_t candidate_transfer_source_self_copy = 0;
+    uint64_t candidate_host_depth_texture_reads = 0;
+    uint64_t candidate_host_depth_scratch_reads = 0;
+    uint64_t candidate_host_depth_self_stores = 0;
+    uint64_t candidate_host_depth_store_dispatches = 0;
+    uint64_t candidate_attachment_clear_targets = 0;
+    uint64_t candidate_resolve_commands = 0;
+    uint64_t candidate_resolve_surface_aliases = 0;
+    uint64_t candidate_resolve_color_aliases = 0;
+    uint64_t candidate_resolve_copies = 0;
+    uint64_t candidate_resolve_color_clears = 0;
+    uint64_t candidate_resolve_depth_clears = 0;
+    uint64_t candidate_resolve_empty_rectangles = 0;
+    uint64_t candidate_resolve_span_oob = 0;
+    uint64_t candidate_direct_resolve_attempts = 0;
+    uint64_t candidate_direct_resolve_successes = 0;
+    uint64_t candidate_direct_resolve_fallbacks = 0;
+    uint64_t candidate_dump_calls = 0;
+    uint64_t candidate_dump_rectangles = 0;
+    uint64_t candidate_dump_expected_owner_rectangles = 0;
+    uint64_t candidate_dump_cross_kind_owner_rectangles = 0;
+    uint64_t candidate_dump_nonworld_owner_rectangles = 0;
+    uint64_t candidate_standard_resolve_dispatches = 0;
+    // Detail call indexes count every PerformTransfersAndResolveClears call
+    // during the swap; sequence indexes count candidate transfer entries,
+    // including entries omitted after the fixed-capacity buffer overflows.
+    uint64_t candidate_transfer_detail_next_call_index = 0;
+    uint64_t candidate_transfer_detail_next_sequence_index = 0;
+    uint64_t candidate_transfer_detail_overflow = 0;
+    uint32_t candidate_transfer_detail_count = 0;
+    std::array<Ac6WorldTransferDetail, kAc6WorldTransferDetailCapacity>
+        candidate_transfer_details = {};
+    // Generic attachment and transfer observations used only by
+    // AC6_WORLD_SCALE_CLOSURE_DETAIL=1. Indexes count all host-render-target
+    // updates/calls in the swap. Overflow counts observations whose unique
+    // hyperedge couldn't be retained after the corresponding array filled.
+    uint64_t closure_attachment_next_update_index = 0;
+    uint64_t closure_attachment_observations = 0;
+    uint64_t closure_attachment_overflow = 0;
+    uint32_t closure_attachment_detail_count = 0;
+    std::array<Ac6WorldClosureAttachmentDetail,
+               kAc6WorldClosureAttachmentCapacity>
+        closure_attachment_details = {};
+    uint64_t closure_transfer_next_call_index = 0;
+    uint64_t closure_transfer_observations = 0;
+    uint64_t closure_transfer_overflow = 0;
+    uint32_t closure_transfer_detail_count = 0;
+    std::array<Ac6WorldClosureTransferDetail,
+               kAc6WorldClosureTransferCapacity>
+        closure_transfer_details = {};
+  };
+
+  Ac6WorldIdentityTelemetry ConsumeAc6WorldIdentityTelemetry();
+
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
@@ -117,6 +243,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+  // Used only with the command processor's exact constant-clear proof.
+  // Partial transfers and uncleared aspects must retain their previous contents.
+  struct Ac6ClearOverwrite {
+    uint32_t x, y, width, height;
+    bool color, depth, stencil;
+  };
+  bool UpdateWithAc6ClearOverwrite(
+      bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask, const Shader& vertex_shader,
+      const Ac6ClearOverwrite* clear);
   // Binding information for the last successful update.
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
@@ -292,6 +428,51 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // For host render targets.
 
+  // Immutable host-image scale ownership. The AC6 world class currently tags
+  // only the two exact render-target candidates proven by trace telemetry; it
+  // is not a claim that their recursive ownership/resolve closure is complete.
+  // The class is deliberately identity-only in this scaffold: classifying an
+  // image must not by itself alter allocation, addressing, transfer, dump, or
+  // resolve behavior.
+  enum class ScaleClass : uint32_t {
+    kNative,
+    kAc6World,
+
+    kCount,
+  };
+
+  struct ScaleMapping {
+    uint32_t numerator_x = 1;
+    uint32_t denominator_x = 1;
+    uint32_t numerator_y = 1;
+    uint32_t denominator_y = 1;
+
+    bool IsIdentity() const {
+      return numerator_x && denominator_x && numerator_y && denominator_y &&
+             numerator_x == denominator_x &&
+             numerator_y == denominator_y;
+    }
+    bool operator==(const ScaleMapping& other) const {
+      return numerator_x == other.numerator_x &&
+             denominator_x == other.denominator_x &&
+             numerator_y == other.numerator_y &&
+             denominator_y == other.denominator_y;
+    }
+    bool operator!=(const ScaleMapping& other) const {
+      return !(*this == other);
+    }
+  };
+
+  static ScaleClass ClassifyScale(RenderTargetKey key);
+  static ScaleMapping GetScaleMapping(ScaleClass scale_class);
+  // Monotone integer edge mapping, with nearest rounding and exact identity:
+  // B(g, n, d) = floor((2 * n * g + d - 1) / (2 * d)).
+  static uint64_t MapScaleEdge(uint64_t guest_edge, uint32_t numerator,
+                               uint32_t denominator);
+  VkExtent2D GetPhysicalExtent(uint32_t logical_width,
+                               uint32_t logical_height,
+                               const ScaleMapping& mapping) const;
+
   // Can only be destroyed when framebuffers referencing it are destroyed!
   class VulkanRenderTarget final : public RenderTarget {
    public:
@@ -309,12 +490,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Takes ownership of the Vulkan objects passed to the constructor.
     VulkanRenderTarget(RenderTargetKey key, VulkanRenderTargetCache& render_target_cache,
-                       VkImage image, VkDeviceMemory memory, VkImageView view_depth_color,
+                       ScaleClass scale_class, const ScaleMapping& scale_mapping,
+                       const VkExtent2D& physical_extent, VkImage image,
+                       VkDeviceMemory memory, VkImageView view_depth_color,
                        VkImageView view_depth_stencil, VkImageView view_stencil,
                        VkImageView view_srgb, VkImageView view_color_transfer_separate,
                        size_t descriptor_set_index_transfer_source)
         : RenderTarget(key),
           render_target_cache_(render_target_cache),
+          scale_class_(scale_class),
+          scale_mapping_(scale_mapping),
+          physical_extent_(physical_extent),
           image_(image),
           memory_(memory),
           view_depth_color_(view_depth_color),
@@ -324,6 +510,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           view_color_transfer_separate_(view_color_transfer_separate),
           descriptor_set_index_transfer_source_(descriptor_set_index_transfer_source) {}
     ~VulkanRenderTarget();
+
+    ScaleClass scale_class() const { return scale_class_; }
+    const ScaleMapping& scale_mapping() const { return scale_mapping_; }
+    const VkExtent2D& physical_extent() const { return physical_extent_; }
 
     VkImage image() const { return image_; }
 
@@ -373,6 +563,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
    private:
     VulkanRenderTargetCache& render_target_cache_;
 
+    const ScaleClass scale_class_;
+    const ScaleMapping scale_mapping_;
+    const VkExtent2D physical_extent_;
+
     VkImage image_;
     VkDeviceMemory memory_;
 
@@ -409,6 +603,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t color_2_base_tiles : xenos::kEdramBaseTilesBits;  // 54
 
     uint32_t color_3_base_tiles : xenos::kEdramBaseTilesBits;  // 75
+
+    // Scale class and its explicit mapping are part of framebuffer identity.
+    // Keeping both catches accidental changes to a class mapping during the
+    // lifetime of cached render targets.
+    uint32_t scale_class;
+    uint32_t scale_numerator_x;
+    uint32_t scale_denominator_x;
+    uint32_t scale_numerator_y;
+    uint32_t scale_denominator_y;
 
     // Including all the padding, for a stable hash.
     FramebufferKey() { Reset(); }
@@ -540,6 +743,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::MsaaSamples host_depth_source_msaa_samples : xenos::kMsaaSamplesBits;
       uint32_t source_resource_format : xenos::kRenderTargetFormatBits;
 
+      // Dormant until non-identity mappings have complete shader/addressing
+      // support. These still separate pipeline cache entries by immutable
+      // source and destination ownership class.
+      static_assert(size_t(ScaleClass::kCount) <= (size_t(1) << 2));
+      ScaleClass dest_scale_class : 2;
+      ScaleClass source_scale_class : 2;
+      ScaleClass host_depth_source_scale_class : 2;
+
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
       // additional stencil texture.
@@ -650,6 +861,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     struct {
       xenos::MsaaSamples msaa_samples : 2;
       uint32_t resource_format : 4;
+      ScaleClass source_scale_class : 2;
       // Last bit because this affects the pipeline - after sorting, only change
       // it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
@@ -807,7 +1019,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
-      const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
+      const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
+      const Transfer::Rectangle* ac6_discard_rectangle = nullptr,
+      uint32_t ac6_discard_mask = 0);
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
@@ -815,10 +1029,28 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                               draw_util::ResolveCopyShaderIndex copy_shader,
                               bool draw_resolution_scaled);
 
+  static bool IsAc6WorldColorRenderTargetKey(RenderTargetKey key);
+  static bool IsAc6WorldDepthRenderTargetKey(RenderTargetKey key);
+  static bool IsAc6WorldRenderTargetKey(RenderTargetKey key) {
+    return IsAc6WorldColorRenderTargetKey(key) ||
+           IsAc6WorldDepthRenderTargetKey(key);
+  }
+  static bool IsAc6WorldResolveEdramInfo(
+      draw_util::ResolveEdramInfo edram_info);
+
+  enum class Ac6WorldDumpExpectedKind : uint32_t {
+    kNone,
+    kColor,
+    kDepth,
+  };
+
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
+  bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
+                         uint32_t dump_rows, uint32_t dump_pitch,
+                         Ac6WorldDumpExpectedKind ac6_world_expected_kind);
 
   bool gamma_render_target_as_unorm16_ = false;
 
@@ -879,6 +1111,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  Ac6WorldIdentityTelemetry ac6_world_identity_telemetry_;
 
   // For traces.
   VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;

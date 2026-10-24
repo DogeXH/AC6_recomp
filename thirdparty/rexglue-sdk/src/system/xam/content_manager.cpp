@@ -213,7 +213,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   // win, same rule as the assets folder (and Windows' local-DLL search order).
   // A container replaces its extracted twin in the listing; unique names
   // simply append.
-  if (!containers_.empty() && title_id == kernel_state_->title_id()) {
+  // Discovered marketplace packages are common (xuid 0) content. The XAM
+  // enumerator asks for both the signed-in profile and common content, so
+  // returning these for the profile request would expose every DLC twice.
+  if (xuid == 0 && !containers_.empty() && title_id == kernel_state_->title_id()) {
     for (const auto& [key, container] : containers_) {
       if (container.content_type != content_type) {
         continue;
@@ -287,10 +290,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   if (data.title_id == uint32_t(-1)) {
     data.title_id = kernel_state_->title_id();
   }
-  if (data.xuid == uint64_t(-1)) {
-    data.xuid = xuid;
-  }
-  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  data.xuid = xuid;
+  uint64_t used_xuid = xuid;
 
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
@@ -346,6 +347,10 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   }
 
   std::memcpy(&data, buffer.data(), buffer.size());
+  // The header's directory is authoritative. Stale guest fields must not
+  // turn profile content into common content or content for another title.
+  data.xuid = xuid;
+  data.title_id = title_id;
   return X_ERROR_SUCCESS;
 }
 

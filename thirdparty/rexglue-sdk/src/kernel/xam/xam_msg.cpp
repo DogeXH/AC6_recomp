@@ -17,6 +17,10 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#if REX_HAVE_AC6NET
+#include "netplay_glue.h"
+#endif
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -50,6 +54,19 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
                                  uint32_t buffer_ptr, uint32_t buffer_length,
                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+#if REX_HAVE_AC6NET
+  // Netplay: XGI and XLiveBase requests with an overlapped run on the glue workers (their
+  // handlers may block on lobby RPCs) and complete later. Without an overlapped they stay
+  // synchronous.
+  if (overlapped_ptr && netplay::ShouldDispatchAsync(app, message)) {
+    const X_RESULT async_result = netplay::DispatchMessageAsync(
+        REX_KERNEL_STATE(), app, message, buffer_ptr, buffer_length, overlapped_ptr);
+    if (async_result == X_ERROR_SUCCESS || async_result == X_ERROR_IO_PENDING) {
+      XThread::SetLastError(0);
+    }
+    return async_result;
+  }
+#endif
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
                                                                         buffer_length);
   if (result == X_E_NOTFOUND) {
@@ -84,6 +101,17 @@ ppc_u32_result_t XMsgStartIORequest_entry(ppc_u32_t app, ppc_u32_t message,
 
 ppc_u32_result_t XMsgCancelIORequest_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
                                            ppc_u32_t wait) {
+#if REX_HAVE_AC6NET
+  // Netplay requests cannot be aborted mid-RPC; with `wait`, block until the worker has
+  // completed the overlapped so the guest never reuses it under a pending write.
+  if (wait && netplay::Enabled() && netplay::IsAsyncPending(overlapped_ptr.guest_address())) {
+    if (!netplay::WaitAsyncRequest(overlapped_ptr.guest_address(), 15000)) {
+      REXKRNL_WARN("XMsgCancelIORequest: request on {:08X} still running after 15 s",
+                   overlapped_ptr.guest_address());
+    }
+    return 0;
+  }
+#endif
   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
   if (event_handle && wait) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);

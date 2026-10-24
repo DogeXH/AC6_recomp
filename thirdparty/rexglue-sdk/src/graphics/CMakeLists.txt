@@ -148,3 +148,25 @@ if(REXGLUE_USE_D3D12)
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()
 
+
+# Offline GPU trace replay tool (opt-in). The trace reader/player sources are
+# intentionally excluded from production builds; this console tool replays a
+# captured frame through the same GPU code and saves the presenter guest
+# output without creating a window.
+option(REXGLUE_BUILD_TRACE_TOOLS "Build the offline GPU trace replay tool" OFF)
+if(REXGLUE_BUILD_TRACE_TOOLS)
+    if(NOT REXGLUE_USE_VULKAN)
+        message(FATAL_ERROR "REXGLUE_BUILD_TRACE_TOOLS currently requires Vulkan")
+    endif()
+    target_sources(rexgraphics PRIVATE
+        trace_reader.cpp
+        trace_player.cpp
+        trace_replay_entry.cpp
+    )
+    add_executable(rexgpu-vulkan-trace-dump trace_replay_main.cpp)
+    target_sources(rexgpu-vulkan-trace-dump PRIVATE trace_replay_stubs.cpp)
+    target_link_libraries(rexgpu-vulkan-trace-dump PRIVATE rexgraphics rex::kernel rex::audio)
+    # kernel_state.cpp dynamic_casts to rex::audio::AudioSystem; force the
+    # typeinfo object out of librexaudio despite archive scan order.
+    target_link_options(rexgpu-vulkan-trace-dump PRIVATE "-Wl,-u,_ZTIN3rex5audio11AudioSystemE")
+endif()

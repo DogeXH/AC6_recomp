@@ -536,6 +536,9 @@ class TextureCache {
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
   void ResetTextureBindings(bool from_destructor = false);
+  // Invalidates only bindings whose currently referenced texture data became
+  // outdated. Shared-memory watches identify the affected Texture objects.
+  void ResetOutdatedTextureBindings();
 
   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
     const TextureBinding& binding = texture_bindings_[fetch_constant_index];
@@ -544,6 +547,66 @@ class TextureCache {
   // Called when something in a texture binding is changed for the
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
+
+  // Per-frame aggregate diagnostics for RequestTextures. Enabled only when
+  // AC6_TEXTURE_REQUEST_PROFILE is set to a non-empty value other than "0".
+  // Nanoseconds are accumulated without logging in the draw hot path; the
+  // Vulkan implementation prints and clears the aggregate in EndFrame.
+  struct TextureRequestProfile {
+    uint64_t vulkan_calls = 0;
+    uint64_t vulkan_zero_mask_calls = 0;
+    uint64_t requested_bindings = 0;
+
+    uint64_t base_calls = 0;
+    uint64_t out_of_sync_bindings = 0;
+    uint64_t outdated_signals = 0;
+    uint64_t invalidated_bindings = 0;
+    uint64_t parsed_bindings = 0;
+    uint64_t invalid_fetches = 0;
+    uint64_t texture_lookups = 0;
+    uint64_t texture_lookup_nulls = 0;
+    uint64_t textures_created = 0;
+    uint64_t prepare_calls = 0;
+    uint64_t prepare_dedup_hits = 0;
+    uint64_t pending_loads = 0;
+    uint64_t pending_ranges = 0;
+    uint64_t pending_range_bytes = 0;
+    uint64_t request_ranges_calls = 0;
+    uint64_t request_ranges_failures = 0;
+    uint64_t merged_ranges = 0;
+    uint64_t merged_range_bytes = 0;
+    uint64_t all_valid_requests = 0;
+    uint64_t upload_ranges = 0;
+    uint64_t upload_bytes = 0;
+    uint64_t committed_loads = 0;
+    uint64_t fallback_loads = 0;
+    uint64_t binding_update_calls = 0;
+    uint64_t binding_updates = 0;
+
+    uint64_t wrapper_3d_binding_visits = 0;
+    uint64_t wrapper_3d_view_requests = 0;
+    uint64_t usage_binding_visits = 0;
+    uint64_t usage_valid_bindings = 0;
+    uint64_t usage_texture_objects = 0;
+    uint64_t usage_transitions = 0;
+
+    uint64_t vulkan_total_ns = 0;
+    uint64_t vulkan_base_ns = 0;
+    uint64_t vulkan_3d_ns = 0;
+    uint64_t vulkan_usage_ns = 0;
+    uint64_t base_total_ns = 0;
+    uint64_t base_invalidation_ns = 0;
+    uint64_t base_binding_ns = 0;
+    uint64_t base_lookup_ns = 0;
+    uint64_t base_prepare_ns = 0;
+    uint64_t base_ranges_ns = 0;
+    uint64_t base_commit_ns = 0;
+    uint64_t base_update_ns = 0;
+  };
+
+  bool texture_request_profile_enabled_ = false;
+  uint64_t texture_request_profile_frame_index_ = 0;
+  TextureRequestProfile texture_request_profile_;
 
  private:
   struct PendingTextureLoad {
