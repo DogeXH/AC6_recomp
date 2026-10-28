@@ -22,7 +22,7 @@ What is in this folder
   LICENSE.txt, THIRD_PARTY_NOTICES.txt, NOTICES-LINUX-RUNTIME.txt, licenses/
 
 Everything else comes from your system: a Vulkan driver (Mesa RADV on the Steam Deck), X11 or
-XWayland, GTK 3, and PulseAudio or PipeWire.
+XWayland, GTK 3, PulseAudio or PipeWire, and libgcc_s.
 
 
 Requirements

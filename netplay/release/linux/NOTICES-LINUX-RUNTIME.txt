@@ -25,8 +25,8 @@ may replace these files with your own build of glibc 2.44 or later.
 GCC runtime libraries (libstdc++, libgcc)
 -----------------------------------------
 
-The game links GCC's libstdc++ and libgcc statically (Arch's gcc-libs
-16.2.1+r23+gd564253eb6c8-1). They are licensed under the GNU General Public License version 3
-with the GCC Runtime Library Exception 3.1 (licenses/GPL-3.0.txt,
-licenses/GCC-exception-3.1.txt), which permits distributing the combined program under its own
-terms.
+The game links GCC's libstdc++ statically (Arch's gcc-libs 16.2.1+r23+gd564253eb6c8-1), under
+the GNU General Public License version 3 with the GCC Runtime Library Exception 3.1
+(licenses/GPL-3.0.txt, licenses/GCC-exception-3.1.txt), which permits distributing the combined
+program under its own terms. libgcc is not included: the game uses your system's libgcc_s.so.1,
+which every Linux system has.

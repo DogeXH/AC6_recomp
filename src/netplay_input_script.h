@@ -135,7 +135,7 @@ inline constexpr size_t kMaxLineBytes = 4096;
 inline constexpr size_t kMaxLoopDepth = 16;
 inline constexpr uint32_t kMaxLoopCount = 1000000;
 inline constexpr uint32_t kMaxMs = 24u * 60 * 60 * 1000;
-inline constexpr uint32_t kMinScreenshotIntervalMs = 100;
+inline constexpr uint32_t kMinScreenshotIntervalMs = 16;  // 16 ms: video-rate capture (footage)
 
 // Parses a whole script. On failure returns false and sets *error to "line N: reason".
 bool ParseScript(std::string_view text, Script* out, std::string* error);

@@ -295,7 +295,7 @@ TEST_CASE("parse: errors carry line numbers") {
   CHECK(ParseError("loop_start 2\nloop_end x\n").rfind("line 2:", 0) == 0);
   CHECK(ParseError("screenshot\n").rfind("line 1:", 0) == 0);
   CHECK(ParseError("touch\n") == "line 1: usage: touch <path>");
-  CHECK(ParseError("screenshot_every 50 /tmp\n").rfind("line 1: screenshot interval", 0) == 0);
+  CHECK(ParseError("screenshot_every 10 /tmp\n").rfind("line 1: screenshot interval", 0) == 0);
   CHECK(ParseError("screenshot_every 500\n").rfind("line 1:", 0) == 0);
   CHECK(ParseError("screenshot_stop now\n").rfind("line 1:", 0) == 0);
   CHECK(ParseError("set speed 1\n").rfind("line 1:", 0) == 0);

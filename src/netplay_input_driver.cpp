@@ -67,7 +67,7 @@ using rex::input::X_INPUT_VIBRATION;
 constexpr uint32_t kScriptUser = 0;
 std::atomic<rex::Runtime*>& RuntimeSlot();
 constexpr uint32_t kTriggerPollMs = 250;
-constexpr uint32_t kMaxPeriodicFrames = 1000;
+constexpr uint32_t kMaxPeriodicFrames = 20000;  // about 11 min at 30 fps
 constexpr size_t kMaxQueuedKeystrokes = 64;
 constexpr uint64_t kKeystrokeMaxAgeMs = 1000;
 
