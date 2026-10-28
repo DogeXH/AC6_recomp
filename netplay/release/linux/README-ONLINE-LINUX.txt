@@ -82,5 +82,5 @@ When you report a problem, include your gamertag, the time, and ac6recomp.log fr
 (the game replaces it at every start, so copy it right after the problem), plus any crash file
 next to it.
 Setup guide and troubleshooting: https://acenet.gg/games/ac6
-Acenet rules, privacy and contact: https://acenet.gg (Discord @dogexandedare).
+Acenet rules, privacy and contact: https://acenet.gg
 Source code: https://github.com/DogeXH/AC6_recomp/tree/netplay-online
