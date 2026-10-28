@@ -1,0 +1,27 @@
+# AC6 Recomp Online - example settings (Linux and Steam Deck build, Beta 1, 2026-10-27).
+#
+# First start without an ac6recomp.toml: rename this file to ac6recomp.toml (in this folder,
+# beside ac6recomp.sh). Already have an ac6recomp.toml: close the game and paste the [netplay]
+# section below at the end of it. Settings not listed here keep their defaults.
+#
+# Use forward slashes in paths. One bad line makes the game ignore the whole file.
+
+# The game finds your .iso in this folder by itself. Set this only if it is elsewhere:
+# game_iso = "/home/you/Games/AC6/Ace Combat 6.iso"
+
+# Two copies on one machine: give each copy its own folder for saves and the online identity
+# (default: ~/.local/share/ac6recomp, identity in its netplay/ folder).
+# user_data_root = "/home/you/Games/AC6/user-data"
+
+[netplay]
+enabled = true
+# The Acenet lobby (https://acenet.gg) and its public key.
+server = "play.acenet.gg:47800"
+server_key = "5a137323790c7f59a64fd640c034def6449894b587f95a4d13f2d059ae8bcc44"
+# The name others see: up to 15 letters, digits and spaces. If it is taken, the server adds a number.
+gamertag = "YourName"
+# 0 picks a free UDP port. Set a fixed one only if you forward it on your router.
+port = 0
+force_relay = false
+privacy = false
+lan = true

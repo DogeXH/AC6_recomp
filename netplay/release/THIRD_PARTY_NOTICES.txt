@@ -8,8 +8,8 @@ to this file. Versions are those of the source copies the exe was built from; wh
 is given, every compiled file of the vendored copy was checked byte-identical to that upstream
 commit.
 
-No game code or data is included in this notice set or in the release. You need your own
-copy of the game.
+No game assets, disc image or XEX are included. ac6recomp.exe contains code recompiled from the
+game executable, as upstream AC6 Recomp's releases do; you need your own copy of the game.
 
 
 1. LGPL components (statically linked)
@@ -49,7 +49,7 @@ Source code and relinking (LGPL 2.1, section 6):
   Source for this build: https://github.com/DogeXH/AC6_recomp/tree/netplay-online (commit 7d841e65)
 - To relink with a modified FFmpeg or libmspack: get that source, replace the library's
   directory with your modified version, generate the recompiled game code from your own copy
-  of the game (it is produced from the game executable and cannot be distributed), and build
+  of the game (it is generated from your own copy of the game executable), and build
   ac6recomp with the documented CMake presets (netplay/docs/BUILDING_WINDOWS.md; upstream's
   setup_and_build.bat on Windows). The AC6 Recomp license permits modification and reverse
   engineering for debugging such modifications.
@@ -112,7 +112,7 @@ SIMDe                    0.8.2 (71fd833d9666, header-only)   MIT                
 o1heap                   3.0.0 (388a73fd9007)                MIT                o1heap.txt
   Copyright (c) 2020 Pavel Kirienko. https://github.com/pavel-kirienko/o1heap
 disruptorplus            vendored (header-only)              MIT                disruptorplus.txt
-  Copyright (c) Lewis Baker. https://github.com/lewissbaker/disruptorplus
+  Copyright (c) 2013 Lewis Baker. https://github.com/lewissbaker/disruptorplus
 aes_128                  vendored                            MIT                aes_128.txt
   Copyright (c) 2017 LuoPeng. https://github.com/openluopworld/aes_128
 cppDES                   vendored                            MIT                cppDES.txt

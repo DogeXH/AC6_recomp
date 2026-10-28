@@ -1,0 +1,31 @@
+# AC6 Recomp Online - example settings (Windows build, Beta 1, 2026-10-27).
+#
+# First start without an ac6recomp.toml: rename this file to ac6recomp.toml (beside
+# ac6recomp.exe). Already have an ac6recomp.toml: close the game and paste the [netplay]
+# section below at the end of it. Settings not listed here keep their defaults.
+#
+# Use forward slashes in paths. One bad line makes the game ignore the whole file.
+
+# Vulkan is the default and the backend online play was tested with ("d3d12" is untested).
+ac6_graphics_backend = "vulkan"
+
+# The game finds your .iso next to ac6recomp.exe by itself. Set this only if it is elsewhere:
+# game_iso = "C:/Games/AC6/Ace Combat 6.iso"
+
+# Portable install or two copies on one PC: give each copy its own folder for saves and the
+# online identity (default: Documents\ac6recomp for saves, %LOCALAPPDATA%\ac6recomp\netplay
+# for the identity).
+# user_data_root = "C:/Games/AC6/user-data"
+
+[netplay]
+enabled = true
+# The Acenet lobby (https://acenet.gg) and its public key.
+server = "play.acenet.gg:47800"
+server_key = "5a137323790c7f59a64fd640c034def6449894b587f95a4d13f2d059ae8bcc44"
+# The name others see: up to 15 letters, digits and spaces. If it is taken, the server adds a number.
+gamertag = "YourName"
+# 0 picks a free UDP port. Set a fixed one only if you forward it on your router.
+port = 0
+force_relay = false
+privacy = false
+lan = true

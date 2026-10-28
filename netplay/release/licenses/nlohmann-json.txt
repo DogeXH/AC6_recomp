@@ -2,12 +2,12 @@ nlohmann/json 3.11.3 (netplay/core/third_party/nlohmann/json.hpp)
 The header carries only SPDX tags:
   SPDX-FileCopyrightText: 2013-2023 Niels Lohmann <https://nlohmann.me>
   SPDX-License-Identifier: MIT
-The MIT license text below is the standard SPDX "MIT" text with that copyright line
-(upstream file: https://github.com/nlohmann/json/blob/v3.11.3/LICENSE.MIT).
+Below is upstream's LICENSE.MIT at tag v3.11.3, verbatim
+(https://github.com/nlohmann/json/blob/v3.11.3/LICENSE.MIT).
 
-MIT License
+MIT License 
 
-Copyright (c) 2013-2023 Niels Lohmann
+Copyright (c) 2013-2022 Niels Lohmann
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

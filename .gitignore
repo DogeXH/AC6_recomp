@@ -50,3 +50,10 @@ extract-xiso.exe
 __pycache__/
 *.pyc
 cache/*
+
+# The netplay docs are part of the published source (the *.md rule above is for local notes)
+!netplay/docs/*.md
+# ...except the test-rig and lab notes (private machines, internal status)
+netplay/docs/TESTING*.md
+netplay/docs/WINDOWS_STATUS.md
+netplay/docs/ARCHITECTURE.md

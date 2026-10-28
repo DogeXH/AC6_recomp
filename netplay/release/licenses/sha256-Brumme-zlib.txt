@@ -3,7 +3,9 @@ The file header says:
   // Copyright (c) 2014,2015 Stephan Brumme. All rights reserved.
   // see http://create.stephan-brumme.com/disclaimer.html
   // Altered for use in Xenia. Licensed under zlib license when acquired.
-The zlib license text below was written for this release from the standard zlib license.
+The author licenses his code "similar to the zlib license"
+(http://create.stephan-brumme.com/disclaimer.html), and Xenia's altered copy states "Licensed
+under zlib license"; the standard zlib license text follows.
 This file was altered from the original by the Xenia project.
 
 Copyright (c) 2014,2015 Stephan Brumme
